@@ -14,7 +14,7 @@ build = "build.rs"
 release = false
 
 [lib]
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 tracing = "0.1"

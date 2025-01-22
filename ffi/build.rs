@@ -12,7 +12,7 @@ fn get_target_dir(manifest_dir: &str) -> PathBuf {
     } else {
         let mut manifest_dir = PathBuf::from(manifest_dir);
         manifest_dir.pop(); // go up, since we're a sub-crate
-        manifest_dir.join("target").join("ffi-headers")
+        manifest_dir.join("ffi-headers")
     }
 }
 
@@ -34,14 +34,4 @@ fn main() {
     cbindgen::generate_with_config(&crate_dir, config_hpp)
         .expect("generate_with_config should have worked for Cxx")
         .write_to_file(output_file_hpp);
-
-    // generate c bindings
-    let output_file_h = target_dir
-        .join(format!("{}.h", package_name))
-        .display()
-        .to_string();
-    config.language = Language::C;
-    cbindgen::generate_with_config(&crate_dir, config)
-        .expect("generate_with_config should have worked for C")
-        .write_to_file(output_file_h);
 }

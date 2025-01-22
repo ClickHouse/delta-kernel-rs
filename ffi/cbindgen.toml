@@ -1,8 +1,11 @@
 # this file gets loaded by build.rs as the set of default options for cbindgen
 
+# For documentation see https://github.com/mozilla/cbindgen/blob/master/docs.md
 
 # default to generating c bindings
-language = "C"
+language = "C++"
+
+cpp_compat = true
 
 pragma_once = true
 
@@ -10,7 +13,7 @@ pragma_once = true
 namespace = "ffi"
 
 [defines]
-"feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
+#"feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
 "feature = sync-engine" = "DEFINE_SYNC_ENGINE"
 
 [export.mangle]
