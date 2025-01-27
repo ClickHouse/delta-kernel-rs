@@ -273,6 +273,18 @@ pub struct CStringMap {
     values: HashMap<String, String>,
 }
 
+impl CStringMap {
+    pub fn new(values: HashMap<String, String>) -> Self {
+        Self { values }
+    }
+
+    pub fn default() -> Self {
+        Self {
+            values: Default::default(),
+        }
+    }
+}
+
 #[no_mangle]
 /// allow probing into a CStringMap. If the specified key is in the map, kernel will call
 /// allocate_fn with the value associated with the key and return the value returned from that
