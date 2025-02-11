@@ -215,7 +215,7 @@ pub unsafe extern "C" fn visit_schema(
                 field.name(),
                 field.data_type(),
                 field.is_nullable(),
-                &metadata,
+                &field.metadata_with_string_values().into(),
                 visitor,
                 child_list_id,
             );
