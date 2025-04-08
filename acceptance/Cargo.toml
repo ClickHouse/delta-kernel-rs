@@ -42,7 +42,7 @@ datatest-stable = "0.2"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 test-case = { version = "3.3.1" }
-tokio = { version = "1.40" }
+tokio = { version = "1.43" }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
