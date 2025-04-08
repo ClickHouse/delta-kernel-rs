@@ -44,7 +44,7 @@ delta_kernel = { path = "../kernel", features = ["default-engine", "sync-engine"
 object_store = { workspace = true }
 rand = "0.8.5"
 test_utils = { path = "../test-utils" }
-tokio = { version = "1.40" }
+tokio = { version = "1.43" }
 trybuild = "1.0"
 
 [features]
