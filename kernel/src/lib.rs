@@ -35,15 +35,15 @@
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`ExpressionHandler`], which in turn allows the creation of
+//! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
 //! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
 //! and allow evaluation of that predicate for a specific batches of data.
 //!
 //! ## File system interactions
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and
-//! reading files. These interactions are encapsulated in the [`FileSystemClient`] trait.
-//! Implementors must take care that all assumptions on the behavior if the functions - like sorted
+//! reading files. These interactions are encapsulated in the [`StorageHandler`] trait.
+//! Implementers must take care that all assumptions on the behavior if the functions - like sorted
 //! results - are respected.
 //!
 //! ## Reading log and data files
@@ -51,7 +51,7 @@
 //! Delta Kernel requires the capability to read and write json files and read parquet files, which
 //! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
 //! connectors are asked to provide the context information it requires to execute the actual
-//! operation. This is done by invoking methods on the [`FileSystemClient`] trait.
+//! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
 #![warn(
@@ -74,6 +74,7 @@ use url::Url;
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
+mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -87,13 +88,20 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
-pub(crate) mod predicates;
+pub mod arrow;
+pub(crate) mod kernel_predicates;
+pub mod parquet;
 pub(crate) mod utils;
 
 #[cfg(feature = "developer-visibility")]
 pub mod path;
 #[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod path;
+
+#[cfg(feature = "developer-visibility")]
+pub mod log_replay;
+#[cfg(not(feature = "developer-visibility"))]
+pub(crate) mod log_replay;
 
 #[cfg(feature = "developer-visibility")]
 pub mod log_segment;
@@ -105,6 +113,10 @@ pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
 pub use table::Table;
+
+use expressions::literal_expression_transform::LiteralExpressionTransform;
+use expressions::Scalar;
+use schema::{SchemaTransform, StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine",
@@ -320,7 +332,7 @@ pub trait ExpressionEvaluator: AsAny {
 ///
 /// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
-pub trait ExpressionHandler: AsAny {
+pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
@@ -332,22 +344,61 @@ pub trait ExpressionHandler: AsAny {
     ///
     /// [`Schema`]: crate::schema::StructType
     /// [`DataType`]: crate::schema::DataType
-    fn get_evaluator(
+    fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a single-row all-null-value [`EngineData`] with the schema specified by
+    /// `output_schema`.
+    // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
+    // future.
+    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
 }
+
+/// Internal trait to allow us to have a private `create_one` API that's implemented for all
+/// EvaluationHandlers.
+// For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
+#[allow(dead_code)]
+trait EvaluationHandlerExtension: EvaluationHandler {
+    /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
+    /// `values`.
+    // Note: we will stick with a Schema instead of DataType (more constrained can expand in
+    // future)
+    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
+        // just get a single int column (arbitrary)
+        let null_row_schema = Arc::new(StructType::new(vec![StructField::nullable(
+            "null_col",
+            DataType::INTEGER,
+        )]));
+        let null_row = self.null_row(null_row_schema.clone())?;
+
+        // Convert schema and leaf values to an expression
+        let mut schema_transform = LiteralExpressionTransform::new(values);
+        schema_transform.transform_struct(schema.as_ref());
+        let row_expr = schema_transform.try_into_expr()?;
+
+        let eval = self.new_expression_evaluator(null_row_schema, row_expr, schema.into());
+        eval.evaluate(null_row.as_ref())
+    }
+}
+
+// Auto-implement the extension trait for all EvaluationHandlers
+impl<T: EvaluationHandler> EvaluationHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///
-/// Delta Kernel uses this client whenever it needs to access the underlying
+/// Delta Kernel uses this handler whenever it needs to access the underlying
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
-pub trait FileSystemClient: AsAny {
-    /// List the paths in the same directory that are lexicographically greater or equal to
+pub trait StorageHandler: AsAny {
+    /// List the paths in the same directory that are lexicographically greater than
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    ///
+    /// If the path is directory-like (ends with '/'), the result should contain
+    /// all the files in the directory.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
@@ -360,7 +411,7 @@ pub trait FileSystemClient: AsAny {
 
 /// Provides JSON handling functionality to Delta Kernel.
 ///
-/// Delta Kernel can use this client to parse JSON strings into Row or read content from JSON files.
+/// Delta Kernel can use this handler to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this trait to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
 pub trait JsonHandler: AsAny {
@@ -457,17 +508,17 @@ pub trait ParquetHandler: AsAny {
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
 pub trait Engine: AsAny {
-    /// Get the connector provided [`ExpressionHandler`].
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
+    /// Get the connector provided [`EvaluationHandler`].
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
 
-    /// Get the connector provided [`FileSystemClient`]
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient>;
+    /// Get the connector provided [`StorageHandler`]
+    fn storage_handler(&self) -> Arc<dyn StorageHandler>;
 
     /// Get the connector provided [`JsonHandler`].
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler>;
+    fn json_handler(&self) -> Arc<dyn JsonHandler>;
 
     /// Get the connector provided [`ParquetHandler`].
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

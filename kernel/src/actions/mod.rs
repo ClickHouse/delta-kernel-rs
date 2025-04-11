@@ -1,8 +1,7 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-use std::any::type_name;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::str::FromStr;
@@ -12,14 +11,16 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{
-    ReaderFeatures, WriterFeatures, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+    ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, RowVisitor as _};
+use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::Schema;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 pub mod deletion_vector;
@@ -47,6 +48,8 @@ pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
 pub(crate) const CDC_NAME: &str = "cdc";
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
@@ -61,6 +64,7 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
         Option::<Cdc>::get_struct_field(CDC_NAME),
         Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
+        Option::<CheckpointMetadata>::get_struct_field(CHECKPOINT_METADATA_NAME),
         // We don't support the following actions yet
         //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
     ])
@@ -88,12 +92,13 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-pub struct Format {
+pub(crate) struct Format {
     /// Name of the encoding for files in this table
-    pub provider: String,
+    pub(crate) provider: String,
     /// A map containing configuration options for the format
-    pub options: HashMap<String, String>,
+    pub(crate) options: HashMap<String, String>,
 }
 
 impl Default for Format {
@@ -107,49 +112,63 @@ impl Default for Format {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-pub struct Metadata {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct Metadata {
     /// Unique identifier for this table
-    pub id: String,
+    pub(crate) id: String,
     /// User-provided identifier for this table
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// User-provided description for this table
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Specification of the encoding for the files stored in the table
-    pub format: Format,
+    pub(crate) format: Format,
     /// Schema of the table
-    pub schema_string: String,
+    pub(crate) schema_string: String,
     /// Column names by which the data should be partitioned
-    pub partition_columns: Vec<String>,
+    pub(crate) partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
-    pub created_time: Option<i64>,
+    pub(crate) created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
-    pub configuration: HashMap<String, String>,
+    pub(crate) configuration: HashMap<String, String>,
 }
 
 impl Metadata {
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.metadata)
     }
 
-    pub fn parse_schema(&self) -> DeltaResult<StructType> {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn configuration(&self) -> &HashMap<String, String> {
+        &self.configuration
+    }
+
+    pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
+    }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn partition_columns(&self) -> &Vec<String> {
+        &self.partition_columns
     }
 
     /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
     /// Note that parsing is infallible -- any items that fail to parse are simply propagated
     /// through to the `TableProperties.unknown_properties` field.
-    pub fn parse_table_properties(&self) -> TableProperties {
+    pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
-pub struct Protocol {
+pub(crate) struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
     min_reader_version: i32,
@@ -159,21 +178,36 @@ pub struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    reader_features: Option<Vec<String>>,
+    reader_features: Option<Vec<ReaderFeature>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    writer_features: Option<Vec<String>>,
+    writer_features: Option<Vec<WriterFeature>>,
+}
+
+fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
+where
+    T: FromStr,
+    T::Err: Debug,
+{
+    features
+        .map(|fs| {
+            fs.into_iter()
+                .map(|f| T::from_str(&f.to_string()))
+                .collect()
+        })
+        .transpose()
+        .expect("Parsing FromStr should never fail with strum 'default'")
 }
 
 impl Protocol {
     /// Try to create a new Protocol instance from reader/writer versions and table features. This
     /// can fail if the protocol is invalid.
-    pub fn try_new(
+    pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
-        writer_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+        reader_features: Option<impl IntoIterator<Item = impl ToString>>,
+        writer_features: Option<impl IntoIterator<Item = impl ToString>>,
     ) -> DeltaResult<Self> {
         if min_reader_version == 3 {
             require!(
@@ -191,8 +225,10 @@ impl Protocol {
                 )
             );
         }
-        let reader_features = reader_features.map(|f| f.into_iter().map(Into::into).collect());
-        let writer_features = writer_features.map(|f| f.into_iter().map(Into::into).collect());
+
+        let reader_features = parse_features(reader_features);
+        let writer_features = parse_features(writer_features);
+
         Ok(Protocol {
             min_reader_version,
             min_writer_version,
@@ -203,48 +239,50 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
     }
 
     /// This protocol's minimum reader version
-    pub fn min_reader_version(&self) -> i32 {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn min_reader_version(&self) -> i32 {
         self.min_reader_version
     }
 
     /// This protocol's minimum writer version
-    pub fn min_writer_version(&self) -> i32 {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn min_writer_version(&self) -> i32 {
         self.min_writer_version
     }
 
     /// Get the reader features for the protocol
-    pub fn reader_features(&self) -> Option<&[String]> {
+    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub fn writer_features(&self) -> Option<&[String]> {
+    pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
-    pub fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
+    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
         self.reader_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// True if this protocol has the requested writer feature
-    pub fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
+    pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
     /// the specified protocol reader version and all enabled reader features? If yes, returns unit
     /// type, otherwise will return an error.
-    pub fn ensure_read_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_read_supported(&self) -> DeltaResult<()> {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
@@ -274,57 +312,67 @@ impl Protocol {
 
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
-    pub fn ensure_write_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
-            // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
-            // supported => OK
-            Some(writer_features)
-                if self.min_reader_version == 3 && self.min_writer_version == 7 =>
-            {
+            Some(writer_features) if self.min_writer_version == 7 => {
+                // if we're on version 7, make sure we support all the specified features
                 ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
             }
-            // otherwise not supported
-            _ => Err(Error::unsupported(
-                "Only tables with min reader version 3 and min writer version 7 with no table features are supported."
-            )),
+            Some(_) => {
+                // there are features, but we're not on 7, so the protocol is actually broken
+                Err(Error::unsupported(
+                    "Tables with min writer version != 7 should not have table features.",
+                ))
+            }
+            None => {
+                // no features, we currently only support version 1 or 2 in this case
+                require!(
+                    self.min_writer_version == 1 || self.min_writer_version == 2,
+                    Error::unsupported(
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"
+                    )
+                );
+                Ok(())
+            }
         }
     }
 }
 
-// given unparsed `table_features`, parse and check if they are subset of `supported_features`
+// given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
-    table_features: &[String],
-    supported_features: &HashSet<T>,
+    table_features: &[T],
+    supported_features: &[T],
 ) -> DeltaResult<()>
 where
+    T: Display + FromStr + Hash + Eq,
     <T as FromStr>::Err: Display,
-    T: Debug + FromStr + Hash + Eq,
 {
-    let error = |unsupported, unsupported_or_unknown| {
-        let supported = supported_features.iter().collect::<Vec<_>>();
-        let features_type = type_name::<T>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("table features");
-        Error::Unsupported(format!(
-            "{} {} {:?}. Supported {} are {:?}",
-            unsupported_or_unknown, features_type, unsupported, features_type, supported
-        ))
-    };
-    let parsed_features: HashSet<T> = table_features
+    // first check if all features are supported, else we proceed to craft an error message
+    if table_features
         .iter()
-        .map(|s| T::from_str(s).map_err(|_| error(vec![s.to_string()], "Unknown")))
-        .collect::<Result<_, Error>>()?;
-    parsed_features
-        .is_subset(supported_features)
-        .then_some(())
-        .ok_or_else(|| {
-            let unsupported = parsed_features
-                .difference(supported_features)
-                .map(|f| format!("{:?}", f))
-                .collect::<Vec<_>>();
-            error(unsupported, "Unsupported")
-        })
+        .all(|feature| supported_features.contains(feature))
+    {
+        return Ok(());
+    }
+
+    // we get the type name (ReaderFeature/WriterFeature) for better error messages
+    let features_type = std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("table feature");
+
+    // NB: we didn't do this above to avoid allocation in the common case
+    let mut unsupported = table_features
+        .iter()
+        .filter(|feature| !supported_features.contains(*feature));
+
+    Err(Error::Unsupported(format!(
+        "Unknown {}s: \"{}\". Supported {}s: \"{}\"",
+        features_type,
+        unsupported.join("\", \""),
+        features_type,
+        supported_features.iter().join("\", \""),
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -357,30 +405,31 @@ pub(crate) struct CommitInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-pub struct Add {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    pub path: String,
+    pub(crate) path: String,
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
     /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
     /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
     #[drop_null_container_values]
-    pub partition_values: HashMap<String, String>,
+    pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
-    pub size: i64,
+    pub(crate) size: i64,
 
     /// The time this logical file was created, as milliseconds since the epoch.
-    pub modification_time: i64,
+    pub(crate) modification_time: i64,
 
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
-    pub data_change: bool,
+    pub(crate) data_change: bool,
 
     /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
     ///
@@ -412,7 +461,9 @@ pub struct Add {
 }
 
 impl Add {
-    pub fn dv_unique_id(&self) -> Option<String> {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }
@@ -500,27 +551,27 @@ pub(crate) struct Cdc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-pub struct SetTransaction {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
-    pub app_id: String,
+    pub(crate) app_id: String,
 
     /// An application-specific numeric identifier for this transaction.
-    pub version: i64,
+    pub(crate) version: i64,
 
     /// The time when this transaction action was created in milliseconds since the Unix epoch.
-    pub last_updated: Option<i64>,
+    pub(crate) last_updated: Option<i64>,
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
-    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.  
+    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.
     /// - An absolute path
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax], which needs to be decoded
     /// to get the file path.
@@ -536,6 +587,43 @@ pub(crate) struct Sidecar {
 
     /// A map containing any additional metadata about the logicial file.
     pub tags: Option<HashMap<String, String>>,
+}
+
+impl Sidecar {
+    /// Convert a Sidecar record to a FileMeta.
+    ///
+    /// This helper first builds the URL by joining the provided log_root with
+    /// the "_sidecars/" folder and the given sidecar path.
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+        Ok(FileMeta {
+            location: log_root.join("_sidecars/")?.join(&self.path)?,
+            last_modified: self.modification_time,
+            size: self.size_in_bytes.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "Failed to convert sidecar size {} to usize",
+                    self.size_in_bytes
+                ))
+            })?,
+        })
+    }
+}
+
+/// The CheckpointMetadata action describes details about a checkpoint following the V2 specification.
+///
+/// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct CheckpointMetadata {
+    /// The version of the V2 spec checkpoint.
+    ///
+    /// Currently using `i64` for compatibility with other actions' representations.
+    /// Future work will address converting numeric fields to unsigned types (e.g., `u64`) where
+    /// semantically appropriate (e.g., for version, size, timestamps, etc.).
+    /// See issue #786 for tracking progress.
+    pub(crate) version: i64,
+
+    /// Map containing any additional metadata about the V2 spec checkpoint.
+    pub(crate) tags: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -699,6 +787,21 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[CHECKPOINT_METADATA_NAME])
+            .expect("Couldn't get checkpointMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "checkpointMetadata",
+            StructType::new([
+                StructField::not_null("version", DataType::LONG),
+                tags_field(),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
     fn test_transaction_schema() {
         let schema = get_log_schema()
             .project(&["txn"])
@@ -783,21 +886,21 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_checkpoint_unsupported() {
+    fn test_v2_checkpoint_supported() {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol::try_new(
             4,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_err());
@@ -817,17 +920,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
             Some(&empty_features),
-        )
-        .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some(&empty_features),
-            Some([WriterFeatures::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -835,11 +929,20 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([WriterFeatures::V2Checkpoint]),
+            Some(&empty_features),
+            Some([WriterFeature::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
+
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([WriterFeature::V2Checkpoint]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol {
             min_reader_version: 1,
@@ -860,19 +963,24 @@ mod tests {
 
     #[test]
     fn test_ensure_write_supported() {
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![]),
-            writer_features: Some(vec![]),
-        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                WriterFeature::AppendOnly,
+                WriterFeature::DeletionVectors,
+                WriterFeature::Invariants,
+            ]),
+        )
+        .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
 
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::RowTracking]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());
@@ -880,26 +988,34 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [
-            ReaderFeatures::ColumnMapping,
-            ReaderFeatures::DeletionVectors,
-        ]
-        .into_iter()
-        .collect();
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string()];
+        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors];
+        let table_features = vec![ReaderFeature::ColumnMapping];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string(), "idk".to_string()];
+        let table_features = vec![ReaderFeature::ColumnMapping, ReaderFeature::unknown("idk")];
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [ColumnMapping, DeletionVectors]"
+                "Unknown ReaderFeatures: \"idk\". Supported ReaderFeatures: \"columnMapping\", \"deletionVectors\""
             => {},
-            Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [DeletionVectors, ColumnMapping]"
-            => {},
-            _ => panic!("Expected unsupported error"),
+            _ => panic!("Expected unsupported error, got: {error}"),
         }
+    }
+
+    #[test]
+    fn test_parse_table_feature_never_fails() {
+        // parse a non-str
+        let features = Some([5]);
+        let expected = Some(vec![ReaderFeature::unknown("5")]);
+        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+
+        // weird strs
+        let features = Some(["", "absurD_)(+13%^⚙️"]);
+        let expected = Some(vec![
+            ReaderFeature::unknown(""),
+            ReaderFeature::unknown("absurD_)(+13%^⚙️"),
+        ]);
+        assert_eq!(parse_features::<ReaderFeature>(features), expected);
     }
 }

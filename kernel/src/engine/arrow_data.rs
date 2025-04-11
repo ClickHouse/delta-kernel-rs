@@ -2,17 +2,23 @@ use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor}
 use crate::schema::{ColumnName, DataType};
 use crate::{DeltaResult, Error};
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{
+use crate::arrow::array::cast::AsArray;
+use crate::arrow::array::types::{Int32Type, Int64Type};
+use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
-use arrow_schema::{DataType as ArrowDataType, FieldRef};
+use crate::arrow::datatypes::{DataType as ArrowDataType, FieldRef};
 use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
 
-/// ArrowEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
+pub use crate::engine::arrow_utils::fix_nested_null_masks;
+
+/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
+///
+/// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
+/// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
+/// example. When in doubt, call [`fix_nested_null_masks`] first.
 pub struct ArrowEngineData {
     data: RecordBatch,
 }
@@ -40,6 +46,12 @@ impl ArrowEngineData {
 impl From<RecordBatch> for ArrowEngineData {
     fn from(value: RecordBatch) -> Self {
         ArrowEngineData::new(value)
+    }
+}
+
+impl From<StructArray> for ArrowEngineData {
+    fn from(value: StructArray) -> Self {
+        ArrowEngineData::new(value.into())
     }
 }
 
@@ -282,31 +294,20 @@ impl ArrowEngineData {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::arrow::array::StringArray;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-
+    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::utils::test_utils::string_array_to_engine_data;
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
-        DeltaResult, Engine, EngineData,
+        DeltaResult, Engine,
     };
-
-    use super::ArrowEngineData;
-
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
-    }
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
         let engine = SyncEngine::new();
-        let handler = engine.get_json_handler();
+        let handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
         ]
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn test_protocol_extract() -> DeltaResult<()> {
         let engine = SyncEngine::new();
-        let handler = engine.get_json_handler();
+        let handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
@@ -337,10 +338,13 @@ mod tests {
         let protocol = Protocol::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(protocol.min_reader_version(), 3);
         assert_eq!(protocol.min_writer_version(), 7);
-        assert_eq!(protocol.reader_features(), Some(["rw1".into()].as_slice()));
+        assert_eq!(
+            protocol.reader_features(),
+            Some([ReaderFeature::unknown("rw1")].as_slice())
+        );
         assert_eq!(
             protocol.writer_features(),
-            Some(["rw1".into(), "w2".into()].as_slice())
+            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }

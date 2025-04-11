@@ -9,7 +9,6 @@
 .zed
 
 # Rust
-.cargo/
 target/
 integration-tests/Cargo.lock
 

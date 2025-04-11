@@ -12,10 +12,10 @@ use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, Engine, ExpressionRef, FileMeta};
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanData};
+use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
-use super::scan_file::scan_data_to_scan_file;
+use super::scan_file::scan_metadata_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
@@ -177,15 +177,16 @@ impl TableChangesScanBuilder {
 }
 
 impl TableChangesScan {
-    /// Returns an iterator of [`TableChangesScanData`] necessary to read CDF. Each row
+    /// Returns an iterator of [`TableChangesScanMetadata`] necessary to read CDF. Each row
     /// represents an action in the delta log. These rows are filtered to yield only the actions
-    /// necessary to read CDF. Additionally, [`TableChangesScanData`] holds metadata on the
-    /// deletion vectors present in the commit. The engine data in each scan data is guaranteed
-    /// to belong to the same commit. Several [`TableChangesScanData`] may belong to the same commit.
-    fn scan_data(
+    /// necessary to read CDF. Additionally, [`TableChangesScanMetadata`] holds metadata on the
+    /// deletion vectors present in the commit. The engine data in each scan metadata is guaranteed
+    /// to belong to the same commit. Several [`TableChangesScanMetadata`] may belong to the same
+    /// commit.
+    fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
         let commits = self
             .table_changes
             .log_segment
@@ -197,7 +198,7 @@ impl TableChangesScan {
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
-        let schema = self.table_changes.end_snapshot.schema().clone().into();
+        let schema = self.table_changes.end_snapshot.schema();
         let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
         Ok(Some(it).into_iter().flatten())
     }
@@ -238,8 +239,8 @@ impl TableChangesScan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
-        let scan_data = self.scan_data(engine.clone())?;
-        let scan_files = scan_data_to_scan_file(scan_data);
+        let scan_metadata = self.scan_metadata(engine.clone())?;
+        let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let global_scan_state = self.global_scan_state();
         let table_root = self.table_changes.table_root().clone();
@@ -286,7 +287,7 @@ fn read_scan_file(
         physical_to_logical_expr(&scan_file, global_state.logical_schema.as_ref(), all_fields)?;
     let physical_schema =
         scan_file_physical_schema(&scan_file, global_state.physical_schema.as_ref());
-    let phys_to_logical_eval = engine.get_expression_handler().get_evaluator(
+    let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
         physical_to_logical_expr,
         global_state.logical_schema.clone().into(),
@@ -301,7 +302,7 @@ fn read_scan_file(
         size: 0,
         location,
     };
-    let read_result_iter = engine.get_parquet_handler().read_parquet_files(
+    let read_result_iter = engine.parquet_handler().read_parquet_files(
         &[file],
         physical_schema,
         physical_predicate,

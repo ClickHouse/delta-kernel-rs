@@ -8,19 +8,18 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
-use crate::schema::{Schema, SchemaRef};
+use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeatures,
-    WriterFeatures,
+    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeature,
+    WriterFeature,
 };
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Version};
+use crate::{DeltaResult, Error, Version};
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
@@ -33,7 +32,7 @@ use crate::{DeltaResult, Version};
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -88,57 +87,101 @@ impl TableConfiguration {
             version,
         })
     }
+
+    pub(crate) fn try_new_from(
+        table_configuration: &Self,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+        new_version: Version,
+    ) -> DeltaResult<Self> {
+        // simplest case: no new P/M, just return the existing table configuration with new version
+        if new_metadata.is_none() && new_protocol.is_none() {
+            return Ok(Self {
+                version: new_version,
+                ..table_configuration.clone()
+            });
+        }
+
+        // note that while we could pick apart the protocol/metadata updates and validate them
+        // individually, instead we just re-parse so that we can recycle the try_new validation
+        // (instead of duplicating it here).
+        Self::try_new(
+            new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
+            new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
+            table_configuration.table_root.clone(),
+            new_version,
+        )
+    }
+
     /// The [`Metadata`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
+
     /// The [`Protocol`] of this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
-    /// The [`Schema`] of for this table at this version.
+
+    /// The logical schema ([`SchemaRef`]) of this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn schema(&self) -> &Schema {
-        self.schema.as_ref()
+    pub(crate) fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
+
     /// The [`TableProperties`] of this table at this version.
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
     }
+
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_root(&self) -> &Url {
         &self.table_root
     }
+
     /// The [`Version`] which this [`TableConfiguration`] belongs to.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn version(&self) -> Version {
         self.version
     }
+
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn is_write_supported(&self) -> bool {
-        self.protocol.ensure_write_supported().is_ok()
+    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+        self.protocol.ensure_write_supported()?;
+
+        // for now we don't allow invariants so although we support writer version 2 and the
+        // ColumnInvariant TableFeature we _must_ check here that they are not actually in use
+        if self.is_invariants_supported()
+            && InvariantChecker::has_invariants(self.schema().as_ref())
+        {
+            return Err(Error::unsupported(
+                "Column invariants are not yet supported",
+            ));
+        }
+
+        Ok(())
     }
+
     /// Returns `true` if kernel supports reading Change Data Feed on this table.
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
-            LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
+        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
+            LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
@@ -159,21 +202,22 @@ impl TableConfiguration {
         );
         protocol_supported && cdf_enabled && column_mapping_disabled
     }
+
     /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
     /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
     /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
             .protocol()
-            .has_reader_feature(&ReaderFeatures::DeletionVectors)
+            .has_reader_feature(&ReaderFeature::DeletionVectors)
             && self.protocol.min_reader_version() == 3;
         let write_supported = self
             .protocol()
-            .has_writer_feature(&WriterFeatures::DeletionVectors)
+            .has_writer_feature(&WriterFeature::DeletionVectors)
             && self.protocol.min_writer_version() == 7;
         read_supported && write_supported
     }
@@ -183,14 +227,40 @@ impl TableConfiguration {
     /// table property is set to `true`.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
             && self
                 .table_properties
                 .enable_deletion_vectors
                 .unwrap_or(false)
+    }
+
+    /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
+    /// - The table must have a writer version between 2 and 7 (inclusive)
+    /// - If the table is on writer version 7, it must have the [`WriterFeature::AppendOnly`]
+    ///   writer feature.
+    pub(crate) fn is_append_only_supported(&self) -> bool {
+        let protocol = &self.protocol;
+        match protocol.min_writer_version() {
+            7 if protocol.has_writer_feature(&WriterFeature::AppendOnly) => true,
+            version => (2..=6).contains(&version),
+        }
+    }
+
+    #[allow(unused)]
+    pub(crate) fn is_append_only_enabled(&self) -> bool {
+        self.is_append_only_supported() && self.table_properties.append_only.unwrap_or(false)
+    }
+
+    /// Returns `true` if the table supports the column invariant table feature.
+    pub(crate) fn is_invariants_supported(&self) -> bool {
+        let protocol = &self.protocol;
+        match protocol.min_writer_version() {
+            7 if protocol.has_writer_feature(&WriterFeature::Invariants) => true,
+            version => (2..=6).contains(&version),
+        }
     }
 }
 
@@ -201,7 +271,8 @@ mod test {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::table_features::{ReaderFeatures, WriterFeatures};
+    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_properties::TableProperties;
 
     use super::TableConfiguration;
 
@@ -218,8 +289,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -244,8 +315,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -259,16 +330,10 @@ mod test {
             schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
             ..Default::default()
         };
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([WriterFeatures::V2Checkpoint]),
-        )
-        .unwrap();
+        let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0)
-            .expect_err("V2 checkpoint is not supported in kernel");
+            .expect_err("Unknown feature is not supported in kernel");
     }
     #[test]
     fn dv_not_supported() {
@@ -283,13 +348,87 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::TimestampWithoutTimezone]),
-            Some([WriterFeatures::TimestampWithoutTimezone]),
+            Some([ReaderFeature::TimestampWithoutTimezone]),
+            Some([WriterFeature::TimestampWithoutTimezone]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(!table_config.is_deletion_vector_supported());
         assert!(!table_config.is_deletion_vector_enabled());
+    }
+
+    #[test]
+    fn test_try_new_from() {
+        let schema_string =r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            configuration: HashMap::from_iter([(
+                "delta.enableChangeDataFeed".to_string(),
+                "true".to_string(),
+            )]),
+            schema_string: schema_string.clone(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let new_metadata = Metadata {
+            configuration: HashMap::from_iter([
+                (
+                    "delta.enableChangeDataFeed".to_string(),
+                    "false".to_string(),
+                ),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+            schema_string,
+            ..Default::default()
+        };
+        let new_protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors, ReaderFeature::V2Checkpoint]),
+            Some([
+                WriterFeature::DeletionVectors,
+                WriterFeature::V2Checkpoint,
+                WriterFeature::AppendOnly,
+            ]),
+        )
+        .unwrap();
+        let new_version = 1;
+        let new_table_config = TableConfiguration::try_new_from(
+            &table_config,
+            Some(new_metadata.clone()),
+            Some(new_protocol.clone()),
+            new_version,
+        )
+        .unwrap();
+
+        assert_eq!(new_table_config.version(), new_version);
+        assert_eq!(new_table_config.metadata(), &new_metadata);
+        assert_eq!(new_table_config.protocol(), &new_protocol);
+        assert_eq!(new_table_config.schema(), table_config.schema());
+        assert_eq!(
+            new_table_config.table_properties(),
+            &TableProperties {
+                enable_change_data_feed: Some(false),
+                enable_deletion_vectors: Some(true),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            new_table_config.column_mapping_mode(),
+            table_config.column_mapping_mode()
+        );
+        assert_eq!(new_table_config.table_root(), table_config.table_root());
     }
 }

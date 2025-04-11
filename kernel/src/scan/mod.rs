@@ -11,9 +11,11 @@ use url::Url;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
-use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
+use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::log_replay::HasSelectionVector;
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -96,9 +98,7 @@ impl ScanBuilder {
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self
-            .schema
-            .unwrap_or_else(|| self.snapshot.schema().clone().into());
+        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = get_state_info(
             logical_schema.as_ref(),
             &self.snapshot.metadata().partition_columns,
@@ -184,8 +184,9 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Expression) -> bool {
-    use crate::predicates::PredicateEvaluator as _;
-    DefaultPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate) == Some(false)
+    use crate::kernel_predicates::KernelPredicateEvaluator as _;
+    DefaultKernelPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate)
+        == Some(false)
 }
 
 // Build the stats read schema filtering the table schema to keep only skipping-eligible
@@ -322,9 +323,48 @@ pub(crate) enum TransformExpr {
     Partition(usize),
 }
 
-// TODO(nick): Make this a struct in a follow-on PR
-// (data, deletion_vec, transforms)
-pub type ScanData = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
+/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
+/// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
+/// from those files.
+pub struct ScanMetadata {
+    /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
+    pub scan_files: FilteredEngineData,
+
+    /// Row-level transformations to apply to data read from files.
+    ///
+    /// Each entry in this vector corresponds to a row in the `scan_files` data. The entry is an
+    /// optional expression that must be applied to convert the file's data into the logical schema
+    /// expected by the scan:
+    ///
+    /// - `Some(expr)`: Apply this expression to transform the data to match [`Scan::schema()`].
+    /// - `None`: No transformation is needed; the data is already in the correct logical form.
+    ///
+    /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
+    /// have corresponding entries that will be `None`.
+    pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+}
+
+impl ScanMetadata {
+    fn new(
+        data: Box<dyn EngineData>,
+        selection_vector: Vec<bool>,
+        scan_file_transforms: Vec<Option<ExpressionRef>>,
+    ) -> Self {
+        Self {
+            scan_files: FilteredEngineData {
+                data,
+                selection_vector,
+            },
+            scan_file_transforms,
+        }
+    }
+}
+
+impl HasSelectionVector for ScanMetadata {
+    fn has_selected_rows(&self) -> bool {
+        self.scan_files.selection_vector.contains(&true)
+    }
+}
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
@@ -378,9 +418,9 @@ impl Scan {
             .collect()
     }
 
-    /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
-    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
-    /// possible). Each item in the returned iterator is a tuple of:
+    /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
@@ -391,22 +431,22 @@ impl Scan {
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
     /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
-    ///    row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
-    ///    the associated expression _must_ be applied to the data read from the file specified by
-    ///    the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
-    ///    the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
-    ///    elements, no expression need be applied and the data read from disk is already in the
-    ///    correct logical state.
-    pub fn scan_data(
+    ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
+    ///   the associated expression _must_ be applied to the data read from the file specified by
+    ///   the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+    ///   the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
+    ///   elements, no expression need be applied and the data read from disk is already in the
+    ///   correct logical state.
+    pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
         // needed (currently just means no partition cols AND no column mapping but will be extended
         // for other transforms as we support them)
         let static_transform = (self.have_partition_cols
             || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then_some(Arc::new(Scan::get_static_transform(&self.all_fields)));
+            .then(|| Arc::new(Scan::get_static_transform(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
@@ -414,7 +454,7 @@ impl Scan {
         };
         let it = scan_action_iter(
             engine,
-            self.replay_for_scan_data(engine)?,
+            self.replay_for_scan_metadata(engine)?,
             self.logical_schema.clone(),
             static_transform,
             physical_predicate,
@@ -423,18 +463,21 @@ impl Scan {
     }
 
     // Factored out to facilitate testing
-    fn replay_for_scan_data(
+    fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
-        self.snapshot
-            .log_segment()
-            .replay(engine, commit_read_schema, checkpoint_read_schema, None)
+        self.snapshot.log_segment().read_actions(
+            engine,
+            commit_read_schema,
+            checkpoint_read_schema,
+            None,
+        )
     }
 
     /// Get global state that is valid for the entire scan. This is somewhat expensive so should
@@ -448,14 +491,14 @@ impl Scan {
         }
     }
 
-    /// Perform an "all in one" scan. This will use the provided `engine` to read and
-    /// process all the data for the query. Each [`ScanResult`] in the resultant iterator encapsulates
-    /// the raw data and an optional boolean vector built from the deletion vector if it was
-    /// present. See the documentation for [`ScanResult`] for more details. Generally
-    /// connectors/engines will want to use [`Scan::scan_data`] so they can have more control over
-    /// the execution of the scan.
-    // This calls [`Scan::scan_data`] to get an iterator of `ScanData` actions for the scan, and then uses the
-    // `engine`'s [`crate::ParquetHandler`] to read the actual table data.
+    /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
+    /// the data for the query. Each [`ScanResult`] in the resultant iterator encapsulates the raw
+    /// data and an optional boolean vector built from the deletion vector if it was present. See
+    /// the documentation for [`ScanResult`] for more details. Generally connectors/engines will
+    /// want to use [`Scan::scan_metadata`] so they can have more control over the execution of the
+    /// scan.
+    // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
+    // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
@@ -466,7 +509,7 @@ impl Scan {
             dv_info: DvInfo,
             transform: Option<ExpressionRef>,
         }
-        fn scan_data_callback(
+        fn scan_metadata_callback(
             batches: &mut Vec<ScanFile>,
             path: &str,
             size: i64,
@@ -492,18 +535,12 @@ impl Scan {
         let table_root = self.snapshot.table_root().clone();
         let physical_predicate = self.physical_predicate();
 
-        let scan_data = self.scan_data(engine.as_ref())?;
-        let scan_files_iter = scan_data
+        let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
+        let scan_files_iter = scan_metadata_iter
             .map(|res| {
-                let (data, vec, transforms) = res?;
+                let scan_metadata = res?;
                 let scan_files = vec![];
-                state::visit_scan_files(
-                    data.as_ref(),
-                    &vec,
-                    &transforms,
-                    scan_files,
-                    scan_data_callback,
-                )
+                scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
@@ -525,7 +562,7 @@ impl Scan {
                 // partition columns, but the read schema we use here does _NOT_ include partition
                 // columns. So we cannot safely assume that all column references are valid. See
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                let read_result_iter = engine.get_parquet_handler().read_parquet_files(
+                let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.physical_schema.clone(),
                     physical_predicate.clone(),
@@ -567,7 +604,7 @@ impl Scan {
     }
 }
 
-/// Get the schema that scan rows (from [`Scan::scan_data`]) will be returned with.
+/// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
 ///
 /// It is:
 /// ```ignored
@@ -655,18 +692,18 @@ pub fn selection_vector(
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
-    let fs_client = engine.get_file_system_client();
-    let dv_treemap = descriptor.read(fs_client, table_root)?;
+    let storage = engine.storage_handler();
+    let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
 
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
+    use crate::arrow::array::StringArray;
+    use crate::utils::test_utils::string_array_to_engine_data;
+    use itertools::Itertools;
     use std::sync::Arc;
-
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
     use crate::{
         actions::get_log_schema,
@@ -676,37 +713,59 @@ pub(crate) mod test_utils {
         },
         scan::log_replay::scan_action_iter,
         schema::SchemaRef,
-        EngineData, JsonHandler,
+        JsonHandler,
     };
 
     use super::{state::ScanCallback, Transform};
 
-    // TODO(nick): Merge all copies of this into one "test utils" thing
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
+    // Generates a batch of sidecar actions with the given paths.
+    // The schema is provided as null columns affect equality checks.
+    pub(crate) fn sidecar_batch_with_given_paths(
+        paths: Vec<&str>,
+        output_schema: SchemaRef,
+    ) -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+
+        let mut json_strings: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            format!(
+                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
+            )
+        })
+        .collect();
+        json_strings.push(r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#.to_string());
+
+        let json_strings_array: StringArray =
+            json_strings.iter().map(|s| s.as_str()).collect_vec().into();
+
+        let parsed = handler
+            .parse_json(
+                string_array_to_engine_data(json_strings_array),
+                output_schema,
+            )
+            .unwrap();
+
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
-    // simple add
-    pub(crate) fn add_batch_simple() -> Box<ArrowEngineData> {
+    // Generates a batch with an add action.
+    // The schema is provided as null columns affect equality checks.
+    pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
         ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
-    // add batch with a removed file
-    pub(crate) fn add_batch_with_remove() -> Box<ArrowEngineData> {
+    // An add batch with a removed file parsed with the schema provided
+    pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -715,7 +774,6 @@ pub(crate) mod test_utils {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -761,16 +819,11 @@ pub(crate) mod test_utils {
         );
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel, transforms) = res.unwrap();
-            assert_eq!(sel, expected_sel_vec);
-            crate::scan::state::visit_scan_files(
-                batch.as_ref(),
-                &sel,
-                &transforms,
-                context.clone(),
-                validate_callback,
-            )
-            .unwrap();
+            let scan_metadata = res.unwrap();
+            assert_eq!(scan_metadata.scan_files.selection_vector, expected_sel_vec);
+            scan_metadata
+                .visit_scan_files(context.clone(), validate_callback)
+                .unwrap();
             batch_count += 1;
         }
         assert_eq!(batch_count, 1);
@@ -959,8 +1012,8 @@ mod tests {
     }
 
     fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
-        let scan_data = scan.scan_data(engine)?;
-        fn scan_data_callback(
+        let scan_metadata_iter = scan.scan_metadata(engine)?;
+        fn scan_metadata_callback(
             paths: &mut Vec<String>,
             path: &str,
             _size: i64,
@@ -973,21 +1026,15 @@ mod tests {
             assert!(dv_info.deletion_vector.is_none());
         }
         let mut files = vec![];
-        for data in scan_data {
-            let (data, vec, transforms) = data?;
-            files = state::visit_scan_files(
-                data.as_ref(),
-                &vec,
-                &transforms,
-                files,
-                scan_data_callback,
-            )?;
+        for res in scan_metadata_iter {
+            let scan_metadata = res?;
+            files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
         }
         Ok(files)
     }
 
     #[test]
-    fn test_scan_data_paths() {
+    fn test_scan_metadata_paths() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1005,7 +1052,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_scan_data() {
+    fn test_scan_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1066,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_for_scan_data() {
+    fn test_replay_for_scan_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
@@ -1075,7 +1122,7 @@ mod tests {
         let snapshot = table.snapshot(&engine, None).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let data: Vec<_> = scan
-            .replay_for_scan_data(&engine)
+            .replay_for_scan_metadata(&engine)
             .unwrap()
             .try_collect()
             .unwrap();

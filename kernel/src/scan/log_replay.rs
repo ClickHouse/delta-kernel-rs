@@ -3,39 +3,74 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
-use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanData, Transform};
+use super::{ScanMetadata, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
-use crate::scan::{DeletionVectorDescriptor, TransformExpr};
+use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
+use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::scan::{Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 
-/// The subset of file action fields that uniquely identifies it in the log, used for deduplication
-/// of adds and removes during log replay.
-#[derive(Debug, Hash, Eq, PartialEq)]
-struct FileActionKey {
-    path: String,
-    dv_unique_id: Option<String>,
-}
-impl FileActionKey {
-    fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
-        let path = path.into();
-        Self { path, dv_unique_id }
-    }
-}
-
-struct LogReplayScanner {
-    filter: Option<DataSkippingFilter>,
-
+/// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
+///
+/// During a table scan, the processor reads batches of log actions (in reverse chronological order)
+/// and performs the following steps:
+///
+/// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
+///   files that are irrelevant for the query.
+/// - Partition Pruning: Uses an optional partition filter (extracted from a physical predicate)
+///   to exclude actions whose partition values do not meet the required criteria.
+/// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
+///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
+/// - Transformation: Applies a built-in transformation (`add_transform`) to convert selected Add actions
+///   into [`ScanMetadata`], the intermediate format passed to the engine.
+/// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those derived
+///   from projection or filters) are preserved and passed through to the engine, which applies them as part
+///   of its scan execution logic.
+///
+/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
+/// `process_actions_batch` method, which applies these steps to each batch of log actions and
+/// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
+/// vector indicating which rows are valid, and any row-level transformation expressions that need
+/// to be applied to the selected rows.
+struct ScanLogReplayProcessor {
+    partition_filter: Option<ExpressionRef>,
+    data_skipping_filter: Option<DataSkippingFilter>,
+    add_transform: Arc<dyn ExpressionEvaluator>,
+    logical_schema: SchemaRef,
+    transform: Option<Arc<Transform>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen: HashSet<FileActionKey>,
+    seen_file_keys: HashSet<FileActionKey>,
+}
+
+impl ScanLogReplayProcessor {
+    /// Create a new [`ScanLogReplayProcessor`] instance
+    fn new(
+        engine: &dyn Engine,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        logical_schema: SchemaRef,
+        transform: Option<Arc<Transform>>,
+    ) -> Self {
+        Self {
+            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
+            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            add_transform: engine.evaluation_handler().new_expression_evaluator(
+                get_log_add_schema().clone(),
+                get_add_transform_expr(),
+                SCAN_ROW_DATATYPE.clone(),
+            ),
+            seen_file_keys: Default::default(),
+            logical_schema,
+            transform,
+        }
+    }
 }
 
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
@@ -43,68 +78,96 @@ struct LogReplayScanner {
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
 struct AddRemoveDedupVisitor<'seen> {
-    seen: &'seen mut HashSet<FileActionKey>,
+    deduplicator: FileActionDeduplicator<'seen>,
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
+    partition_filter: Option<ExpressionRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
-    is_log_batch: bool,
 }
 
 impl AddRemoveDedupVisitor<'_> {
-    /// Checks if log replay already processed this logical file (in which case the current action
-    /// should be ignored). If not already seen, register it so we can recognize future duplicates.
-    /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
-    /// and should process it.
-    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
-        // Note: each (add.path + add.dv_unique_id()) pair has a
-        // unique Add + Remove pair in the log. For example:
-        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`
+    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
+    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
+    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
+    const REMOVE_PATH_INDEX: usize = 5; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
 
-        if self.seen.contains(&key) {
-            debug!(
-                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
-            true
-        } else {
-            debug!(
-                "Including ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
-            if self.is_log_batch {
-                // Remember file actions from this batch so we can ignore duplicates as we process
-                // batches from older commit and/or checkpoint files. We don't track checkpoint
-                // batches because they are already the oldest actions and never replace anything.
-                self.seen.insert(key);
-            }
-            false
+    fn new(
+        seen: &mut HashSet<FileActionKey>,
+        selection_vector: Vec<bool>,
+        logical_schema: SchemaRef,
+        transform: Option<Arc<Transform>>,
+        partition_filter: Option<ExpressionRef>,
+        is_log_batch: bool,
+    ) -> AddRemoveDedupVisitor<'_> {
+        AddRemoveDedupVisitor {
+            deduplicator: FileActionDeduplicator::new(
+                seen,
+                is_log_batch,
+                Self::ADD_PATH_INDEX,
+                Self::REMOVE_PATH_INDEX,
+                Self::ADD_DV_START_INDEX,
+                Self::REMOVE_DV_START_INDEX,
+            ),
+            selection_vector,
+            logical_schema,
+            transform,
+            partition_filter,
+            row_transform_exprs: Vec::new(),
         }
     }
 
-    /// Compute an expression that will transform from physical to logical for a given Add file action
-    fn get_transform_expr<'a>(
+    fn parse_partition_value(
         &self,
-        i: usize,
+        field_idx: usize,
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<(usize, (String, Scalar))> {
+        let field = self.logical_schema.fields.get_index(field_idx);
+        let Some((_, field)) = field else {
+            return Err(Error::InternalError(format!(
+                "out of bounds partition column field index {field_idx}"
+            )));
+        };
+        let name = field.physical_name();
+        let partition_value =
+            super::parse_partition_value(partition_values.get(name), field.data_type())?;
+        Ok((field_idx, (name.to_string(), partition_value)))
+    }
+
+    fn parse_partition_values(
+        &self,
         transform: &Transform,
-        getters: &[&'a dyn GetData<'a>],
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+        transform
+            .iter()
+            .filter_map(|transform_expr| match transform_expr {
+                TransformExpr::Partition(field_idx) => {
+                    Some(self.parse_partition_value(*field_idx, partition_values))
+                }
+                TransformExpr::Static(_) => None,
+            })
+            .try_collect()
+    }
+
+    /// Compute an expression that will transform from physical to logical for a given Add file action
+    fn get_transform_expr(
+        &self,
+        transform: &Transform,
+        mut partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
-        let partition_values: HashMap<_, _> = getters[1].get(i, "add.partitionValues")?;
         let transforms = transform
             .iter()
             .map(|transform_expr| match transform_expr {
                 TransformExpr::Partition(field_idx) => {
-                    let field = self.logical_schema.fields.get_index(*field_idx);
-                    let Some((_, field)) = field else {
-                        return Err(Error::Generic(
-                            format!("logical schema did not contain expected field at {field_idx}, can't transform data")
-                        ));
+                    let Some((_, partition_value)) = partition_values.remove(field_idx) else {
+                        return Err(Error::InternalError(format!(
+                            "missing partition value for field index {field_idx}"
+                        )));
                     };
-                    let name = field.physical_name();
-                    let partition_value = super::parse_partition_value(
-                        partition_values.get(name),
-                        field.data_type(),
-                    )?;
                     Ok(partition_value.into())
                 }
                 TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
@@ -113,40 +176,69 @@ impl AddRemoveDedupVisitor<'_> {
         Ok(Arc::new(Expression::Struct(transforms)))
     }
 
+    fn is_file_partition_pruned(
+        &self,
+        partition_values: &HashMap<usize, (String, Scalar)>,
+    ) -> bool {
+        if partition_values.is_empty() {
+            return false;
+        }
+        let Some(partition_filter) = &self.partition_filter else {
+            return false;
+        };
+        let partition_values: HashMap<_, _> = partition_values
+            .values()
+            .map(|(k, v)| (ColumnName::new([k]), v.clone()))
+            .collect();
+        let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
+        evaluator.eval_sql_where(partition_filter) == Some(false)
+    }
+
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
     fn is_valid_add<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
-        // Add will have a path at index 0 if it is valid; otherwise, if it is a log batch, we may
-        // have a remove with a path at index 4. In either case, extract the three dv getters at
-        // indexes that immediately follow a valid path index.
-        let (path, dv_getters, is_add) = if let Some(path) = getters[0].get_str(i, "add.path")? {
-            (path, &getters[2..5], true)
-        } else if !self.is_log_batch {
-            return Ok(false);
-        } else if let Some(path) = getters[5].get_opt(i, "remove.path")? {
-            (path, &getters[6..9], false)
-        } else {
+        // When processing file actions, we extract path and deletion vector information based on action type:
+        // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
+        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8
+        // The file extraction logic selects the appropriate indexes based on whether we found a valid path.
+        // Remove getters are not included when visiting a non-log batch (checkpoint batch), so do
+        // not try to extract remove actions in that case.
+        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
+            i,
+            getters,
+            !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
+        )?
+        else {
             return Ok(false);
         };
 
-        let dv_unique_id = match dv_getters[0].get_opt(i, "deletionVector.storageType")? {
-            Some(storage_type) => Some(DeletionVectorDescriptor::unique_id_from_parts(
-                storage_type,
-                dv_getters[1].get(i, "deletionVector.pathOrInlineDv")?,
-                dv_getters[2].get_opt(i, "deletionVector.offset")?,
-            )),
-            None => None,
+        // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
+        // tracking pruned files. Removes don't get pruned and we'll still have to track them.
+        //
+        // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
+        // removes), because they are needed to suppress earlier incompatible adds we might
+        // encounter if the table's schema was replaced after the most recent checkpoint.
+        let partition_values = match &self.transform {
+            Some(transform) if is_add => {
+                let partition_values =
+                    getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
+                let partition_values = self.parse_partition_values(transform, &partition_values)?;
+                if self.is_file_partition_pruned(&partition_values) {
+                    return Ok(false);
+                }
+                partition_values
+            }
+            _ => Default::default(),
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
-        let file_key = FileActionKey::new(path, dv_unique_id);
-        if self.check_and_record_seen(file_key) || !is_add {
+        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
         let transform = self
             .transform
             .as_ref()
-            .map(|transform| self.get_transform_expr(i, transform, getters))
+            .map(|transform| self.get_transform_expr(transform, partition_values))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -179,7 +271,7 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
             (names, types).into()
         });
         let (names, types) = NAMES_AND_TYPES.as_ref();
-        if self.is_log_batch {
+        if self.deduplicator.is_log_batch() {
             (names, types)
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
@@ -189,7 +281,8 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let expected_getters = if self.is_log_batch { 9 } else { 5 };
+        let is_log_batch = self.deduplicator.is_log_batch();
+        let expected_getters = if is_log_batch { 9 } else { 5 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -246,45 +339,41 @@ fn get_add_transform_expr() -> Expression {
     ])
 }
 
-impl LogReplayScanner {
-    /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
-        Self {
-            filter: DataSkippingFilter::new(engine, physical_predicate),
-            seen: Default::default(),
-        }
-    }
+impl LogReplayProcessor for ScanLogReplayProcessor {
+    type Output = ScanMetadata;
 
-    fn process_scan_batch(
+    fn process_actions_batch(
         &mut self,
-        add_transform: &dyn ExpressionEvaluator,
-        actions: &dyn EngineData,
-        logical_schema: SchemaRef,
-        transform: Option<Arc<Transform>>,
+        actions_batch: &dyn EngineData,
         is_log_batch: bool,
-    ) -> DeltaResult<ScanData> {
-        // Apply data skipping to get back a selection vector for actions that passed skipping. We
-        // will update the vector below as log replay identifies duplicates that should be ignored.
-        let selection_vector = match &self.filter {
-            Some(filter) => filter.apply(actions)?,
-            None => vec![true; actions.len()],
-        };
-        assert_eq!(selection_vector.len(), actions.len());
+    ) -> DeltaResult<Self::Output> {
+        // Build an initial selection vector for the batch which has had the data skipping filter
+        // applied. The selection vector is further updated by the deduplication visitor to remove
+        // rows that are not valid adds.
+        let selection_vector = self.build_selection_vector(actions_batch)?;
+        assert_eq!(selection_vector.len(), actions_batch.len());
 
-        let mut visitor = AddRemoveDedupVisitor {
-            seen: &mut self.seen,
+        let mut visitor = AddRemoveDedupVisitor::new(
+            &mut self.seen_file_keys,
             selection_vector,
-            logical_schema,
-            transform,
-            row_transform_exprs: Vec::new(),
+            self.logical_schema.clone(),
+            self.transform.clone(),
+            self.partition_filter.clone(),
             is_log_batch,
-        };
-        visitor.visit_rows_of(actions)?;
+        );
+        visitor.visit_rows_of(actions_batch)?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let selection_vector = visitor.selection_vector;
-        let result = add_transform.evaluate(actions)?;
-        Ok((result, selection_vector, visitor.row_transform_exprs))
+        let result = self.add_transform.evaluate(actions_batch)?;
+        Ok(ScanMetadata::new(
+            result,
+            visitor.selection_vector,
+            visitor.row_transform_exprs,
+        ))
+    }
+
+    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
+        self.data_skipping_filter.as_ref()
     }
 }
 
@@ -298,31 +387,16 @@ pub(crate) fn scan_action_iter(
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
-    let add_transform = engine.get_expression_handler().get_evaluator(
-        get_log_add_schema().clone(),
-        get_add_transform_expr(),
-        SCAN_ROW_DATATYPE.clone(),
-    );
-    action_iter
-        .map(move |action_res| {
-            let (batch, is_log_batch) = action_res?;
-            log_scanner.process_scan_batch(
-                add_transform.as_ref(),
-                batch.as_ref(),
-                logical_schema.clone(),
-                transform.clone(),
-                is_log_batch,
-            )
-        })
-        .filter(|res| res.as_ref().map_or(true, |(_, sv, _)| sv.contains(&true)))
+) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
+    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
+        .process_actions_iter(action_iter)
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::actions::get_log_schema;
     use crate::expressions::{column_name, Scalar};
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
@@ -364,7 +438,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter() {
         run_with_validate_callback(
-            vec![add_batch_simple()],
+            vec![add_batch_simple(get_log_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
@@ -376,7 +450,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
-            vec![add_batch_with_remove()],
+            vec![add_batch_with_remove(get_log_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
@@ -387,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_no_transforms() {
-        let batch = vec![add_batch_simple()];
+        let batch = vec![add_batch_simple(get_log_schema().clone())];
         let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -397,8 +471,11 @@ mod tests {
             None,
         );
         for res in iter {
-            let (_batch, _sel, transforms) = res.unwrap();
-            assert!(transforms.is_empty(), "Should have no transforms");
+            let scan_metadata = res.unwrap();
+            assert!(
+                scan_metadata.scan_file_transforms.is_empty(),
+                "Should have no transforms"
+            );
         }
     }
 
@@ -443,7 +520,8 @@ mod tests {
         }
 
         for res in iter {
-            let (_batch, _sel, transforms) = res.unwrap();
+            let scan_metadata = res.unwrap();
+            let transforms = scan_metadata.scan_file_transforms;
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
             // the first and 3rd being a `None`
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");

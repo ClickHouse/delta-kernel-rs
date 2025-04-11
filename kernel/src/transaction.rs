@@ -78,7 +78,9 @@ impl Transaction {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
-        read_snapshot.protocol().ensure_write_supported()?;
+        read_snapshot
+            .table_configuration()
+            .ensure_write_supported()?;
 
         Ok(Transaction {
             read_snapshot,
@@ -110,7 +112,7 @@ impl Transaction {
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
 
         // step three: commit the actions as a json file in the log
-        let json_handler = engine.get_json_handler();
+        let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
             Ok(()) => Ok(CommitResult::Committed(commit_version)),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
@@ -149,8 +151,9 @@ impl Transaction {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
         let partition_columns = &self.read_snapshot.metadata().partition_columns;
-        let fields = self.read_snapshot.schema().fields();
-        let fields = fields
+        let schema = self.read_snapshot.schema();
+        let fields = schema
+            .fields()
             .filter(|f| !partition_columns.contains(f.name()))
             .map(|f| Expression::column([f.name()]));
         Expression::struct_from(fields)
@@ -165,11 +168,7 @@ impl Transaction {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-        WriteContext::new(
-            target_dir.clone(),
-            Arc::new(snapshot_schema.clone()),
-            logical_to_physical,
-        )
+        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
     }
 
     /// Add write metadata about files to include in the transaction. This API can be called
@@ -187,7 +186,7 @@ fn generate_adds<'a>(
     engine: &dyn Engine,
     write_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
-    let expression_handler = engine.get_expression_handler();
+    let evaluation_handler = engine.evaluation_handler();
     let write_metadata_schema = get_write_metadata_schema();
     let log_schema = get_log_add_schema();
 
@@ -197,7 +196,7 @@ fn generate_adds<'a>(
                 .fields()
                 .map(|f| Expression::column([f.name()])),
         )]);
-        let adds_evaluator = expression_handler.get_evaluator(
+        let adds_evaluator = evaluation_handler.new_expression_evaluator(
             write_metadata_schema.clone(),
             adds_expr,
             log_schema.clone().into(),
@@ -321,7 +320,7 @@ fn generate_commit_info(
         .shift_remove("inCommitTimestamp");
     commit_info_field.data_type = DataType::Struct(commit_info_data_type);
 
-    let commit_info_evaluator = engine.get_expression_handler().get_evaluator(
+    let commit_info_evaluator = engine.evaluation_handler().new_expression_evaluator(
         engine_commit_info_schema.into(),
         commit_info_expr,
         commit_info_empty_struct_schema.into(),
@@ -335,52 +334,51 @@ mod tests {
     use super::*;
 
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::arrow_expression::ArrowExpressionHandler;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::schema::MapType;
-    use crate::{ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
+    use crate::{EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
-    use arrow::json::writer::LineDelimitedWriter;
-    use arrow::record_batch::RecordBatch;
-    use arrow_array::builder::StringBuilder;
-    use arrow_schema::Schema as ArrowSchema;
-    use arrow_schema::{DataType as ArrowDataType, Field};
+    use crate::arrow::array::{MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use crate::arrow::error::ArrowError;
+    use crate::arrow::json::writer::LineDelimitedWriter;
+    use crate::arrow::record_batch::RecordBatch;
 
-    struct ExprEngine(Arc<dyn ExpressionHandler>);
+    struct ExprEngine(Arc<dyn EvaluationHandler>);
 
     impl ExprEngine {
         fn new() -> Self {
-            ExprEngine(Arc::new(ArrowExpressionHandler))
+            ExprEngine(Arc::new(ArrowEvaluationHandler))
         }
     }
 
     impl Engine for ExprEngine {
-        fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
             self.0.clone()
         }
 
-        fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
             unimplemented!()
         }
 
-        fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
             unimplemented!()
         }
 
-        fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
             unimplemented!()
         }
     }
 
-    fn build_map(entries: Vec<(&str, &str)>) -> arrow_array::MapArray {
+    fn build_map(entries: Vec<(&str, &str)>) -> MapArray {
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
-        let names = arrow_array::builder::MapFieldNames {
+        let names = MapFieldNames {
             entry: "entries".to_string(),
             key: "key".to_string(),
             value: "value".to_string(),
         };
-        let mut builder =
-            arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+        let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (key, val) in entries {
             builder.keys().append_value(key);
             builder.values().append_value(val);
@@ -494,7 +492,7 @@ mod tests {
             engine_commit_info_schema,
             vec![
                 Arc::new(map_array),
-                Arc::new(arrow_array::StringArray::from(vec!["some_string"])),
+                Arc::new(StringArray::from(vec!["some_string"])),
             ],
         )?;
 
@@ -533,7 +531,7 @@ mod tests {
         )]));
         let commit_info_batch = RecordBatch::try_new(
             engine_commit_info_schema,
-            vec![Arc::new(arrow_array::StringArray::new_null(1))],
+            vec![Arc::new(StringArray::new_null(1))],
         )?;
 
         let _ = generate_commit_info(
@@ -542,12 +540,9 @@ mod tests {
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
-            Error::Arrow(arrow_schema::ArrowError::SchemaError(_)) => (),
+            Error::Arrow(ArrowError::SchemaError(_)) => (),
             Error::Backtraced { source, .. }
-                if matches!(
-                    &*source,
-                    Error::Arrow(arrow_schema::ArrowError::SchemaError(_))
-                ) => {}
+                if matches!(&*source, Error::Arrow(ArrowError::SchemaError(_))) => {}
             _ => panic!("expected arrow schema error error, got {:?}", e),
         });
 
@@ -564,7 +559,7 @@ mod tests {
         )]));
         let commit_info_batch = RecordBatch::try_new(
             engine_commit_info_schema,
-            vec![Arc::new(arrow_array::StringArray::new_null(1))],
+            vec![Arc::new(StringArray::new_null(1))],
         )?;
 
         let _ = generate_commit_info(
@@ -573,12 +568,9 @@ mod tests {
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
-            Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_)) => (),
+            Error::Arrow(ArrowError::InvalidArgumentError(_)) => (),
             Error::Backtraced { source, .. }
-                if matches!(
-                    &*source,
-                    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_))
-                ) => {}
+                if matches!(&*source, Error::Arrow(ArrowError::InvalidArgumentError(_))) => {}
             _ => panic!("expected arrow invalid arg error, got {:?}", e),
         });
 
@@ -644,16 +636,16 @@ mod tests {
                 ),
                 true,
             )]));
-            use arrow_array::builder::StringBuilder;
+
             let key_builder = StringBuilder::new();
             let val_builder = StringBuilder::new();
-            let names = arrow_array::builder::MapFieldNames {
+            let names = crate::arrow::array::MapFieldNames {
                 entry: "entries".to_string(),
                 key: "key".to_string(),
                 value: "value".to_string(),
             };
             let mut builder =
-                arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+                crate::arrow::array::MapBuilder::new(Some(names), key_builder, val_builder);
             builder.append(is_null).unwrap();
             let array = builder.finish();
 
