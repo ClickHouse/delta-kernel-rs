@@ -34,7 +34,7 @@ fn main() {
 
     Builder::new()
         .with_config(config_hpp)
-        .with_crate(&crate_dir)
+        .with_src(String::from(&crate_dir) + "/src/lib.rs")
         .generate()
         .expect("generate should have worked for Cxx")
         .write_to_file(output_file_hpp);
@@ -47,7 +47,7 @@ fn main() {
     config.language = Language::C;
     Builder::new()
         .with_config(config)
-        .with_crate(&crate_dir)
+        .with_src(String::from(&crate_dir) + "/src/lib.rs")
         .generate()
         .expect("generate should have worked for C")
         .write_to_file(output_file_h);
