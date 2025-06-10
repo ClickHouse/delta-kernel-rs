@@ -1,6 +1,6 @@
 extern crate cbindgen;
 
-use cbindgen::{Config, Language};
+use cbindgen::{Builder, Config, Language};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -31,8 +31,12 @@ fn main() {
         .to_string();
     let mut config_hpp = config.clone();
     config_hpp.language = Language::Cxx;
-    cbindgen::generate_with_config(&crate_dir, config_hpp)
-        .expect("generate_with_config should have worked for Cxx")
+
+    Builder::new()
+        .with_config(config_hpp)
+        .with_crate(&crate_dir)
+        .generate()
+        .expect("generate should have worked for Cxx")
         .write_to_file(output_file_hpp);
 
     // generate c bindings
@@ -41,7 +45,10 @@ fn main() {
         .display()
         .to_string();
     config.language = Language::C;
-    cbindgen::generate_with_config(&crate_dir, config)
-        .expect("generate_with_config should have worked for C")
+    Builder::new()
+        .with_config(config)
+        .with_crate(&crate_dir)
+        .generate()
+        .expect("generate should have worked for C")
         .write_to_file(output_file_h);
 }
