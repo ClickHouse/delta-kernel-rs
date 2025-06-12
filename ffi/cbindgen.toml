@@ -9,9 +9,6 @@ pragma_once = true
 # only applies to Cxx
 namespace = "ffi"
 
-[defines]
-"feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
-
 [export.mangle]
 remove_underscores = true
 
