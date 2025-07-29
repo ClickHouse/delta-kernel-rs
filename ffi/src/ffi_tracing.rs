@@ -245,7 +245,7 @@ impl Visit for MessageFieldVisitor {
 }
 
 struct EventLayer {
-    callback: TracingEventFn,
+    callback: Arc<Mutex<TracingEventFn>>,
 }
 
 impl<S> Layer<S> for EventLayer
@@ -270,7 +270,8 @@ where
                 line: metadata.line().unwrap_or(0),
                 file: kernel_string_slice!(file),
             };
-            (self.callback)(event);
+            let cb = self.callback.lock().unwrap();
+            (cb)(event);
         }
     }
 }
@@ -280,6 +281,9 @@ static DISPATCH: LazyLock<Mutex<Option<tracing_core::Dispatch>>> =
 static RELOAD_HANDLE: LazyLock<
     Mutex<Option<tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>>>,
 > = LazyLock::new(|| Mutex::new(None));
+static EVENT_CALLBACK: LazyLock<Mutex<Option<Arc<Mutex<TracingEventFn>>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static LOG_LINE_CALLBACK: LazyLock<Mutex<Option<Arc<Mutex<TracingLogLineFn>>>>> = LazyLock::new(|| Mutex::new(None));
 
 fn get_event_dispatcher(
     callback: TracingEventFn,
@@ -287,13 +291,25 @@ fn get_event_dispatcher(
 ) -> (
     tracing_core::Dispatch,
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
+    Arc<Mutex<TracingEventFn>>,
 ) {
     use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+
+    let callback_arc = Arc::new(Mutex::new(callback));
     let (filter_layer, reload_handle) =
         tracing_subscriber::reload::Layer::new(LevelFilter::from(max_level));
-    let event_layer = EventLayer { callback }.with_filter(filter_layer);
+
+    let event_layer = EventLayer {
+        callback: callback_arc.clone(),
+    }
+    .with_filter(filter_layer);
+
     let subscriber = Registry::default().with(event_layer);
-    (tracing_core::Dispatch::new(subscriber), reload_handle)
+    (
+        tracing_core::Dispatch::new(subscriber),
+        reload_handle,
+        callback_arc,
+    )
 }
 
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
@@ -301,39 +317,33 @@ fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaRe
         return Err(Error::generic("max_level out of range"));
     }
 
-    // Try reloading if already initialized
+    // If a subscriber is already active, try updating only callback or level
     if let Some(reload_handle) = &*RELOAD_HANDLE.lock().unwrap() {
-        match reload_handle.reload(LevelFilter::from(max_level)) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                warn!("Failed to reload tracing level: {e}");
-                return Err(Error::generic(format!("Unable to reload subscriber: {e}")));
-            }
+        if let Some(cb_arc) = &*EVENT_CALLBACK.lock().unwrap() {
+            *cb_arc.lock().unwrap() = callback;
         }
+
+        return reload_handle
+            .reload(LevelFilter::from(max_level))
+            .map_err(|e| {
+                warn!("Failed to reload tracing level: {e}");
+                Error::generic(format!("Unable to reload subscriber: {e}"))
+            });
     }
 
-    // Otherwise, try to install a new global subscriber
-    let (dispatch, reload_handle) = get_event_dispatcher(callback, max_level);
+    // First-time subscriber setup
+    let (dispatch, reload_handle, callback_arc) = get_event_dispatcher(callback, max_level);
+
     match set_global_default(dispatch.clone()) {
         Ok(()) => {
             *DISPATCH.lock().unwrap() = Some(dispatch);
             *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
+            *EVENT_CALLBACK.lock().unwrap() = Some(callback_arc);
             Ok(())
         }
         Err(e) => {
             warn!("Failed to set global default: {e}");
-            // Fallback: try to reload with the new handle instead
-            match reload_handle.reload(LevelFilter::from(max_level)) {
-                Ok(_) => {
-                    *DISPATCH.lock().unwrap() = Some(dispatch);
-                    *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("Failed to reload fallback tracing level: {e}");
-                    Err(Error::generic(format!("Unable to reload subscriber: {e}")))
-                }
-            }
+            Err(Error::generic(format!("Unable to set global subscriber: {e}")))
         }
     }
 }
@@ -343,8 +353,8 @@ fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaRe
 type SharedBuffer = Arc<Mutex<Vec<u8>>>;
 
 struct TriggerLayer {
-    buf: SharedBuffer,
-    callback: TracingLogLineFn,
+    buf: Arc<Mutex<Vec<u8>>>,
+    callback: Arc<Mutex<TracingLogLineFn>>,
 }
 
 impl<S> Layer<S> for TriggerLayer
@@ -356,13 +366,15 @@ where
             Ok(mut buf) => {
                 let message = String::from_utf8_lossy(&buf);
                 let message = kernel_string_slice!(message);
-                (self.callback)(message);
+                let cb = self.callback.lock().unwrap();
+                (cb)(message);
                 buf.clear();
             }
             Err(_) => {
                 let message = "INTERNAL KERNEL ERROR: Could not lock message buffer.";
                 let message = kernel_string_slice!(message);
-                (self.callback)(message);
+                let cb = self.callback.lock().unwrap();
+                (cb)(message);
             }
         }
     }
@@ -405,34 +417,48 @@ fn get_log_line_dispatch(
     with_time: bool,
     with_level: bool,
     with_target: bool,
-) -> tracing_core::Dispatch {
+) -> (
+    tracing_core::Dispatch,
+    tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
+    Arc<Mutex<TracingLogLineFn>>,
+) {
     use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+
+    let callback_arc = Arc::new(Mutex::new(callback));
+
     let buffer = Arc::new(Mutex::new(vec![]));
     let writer = BufferedMessageWriter {
         current_buffer: buffer.clone(),
     };
-    let fmt_layer = tracing_subscriber::fmt::layer()
+
+    let base_fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_ansi(ansi)
         .with_level(with_level)
         .with_target(with_target);
-    let filter: LevelFilter = max_level.into();
+
+    let (filter_layer, reload_handle) =
+        tracing_subscriber::reload::Layer::new(LevelFilter::from(max_level));
+
     let tracking_layer = TriggerLayer {
         buf: buffer.clone(),
-        callback,
+        callback: callback_arc.clone(),
     };
 
-    // This repeats some code, but avoids some insane generic wrangling if we try to abstract the
-    // type of `fmt_layer` over the formatter
     macro_rules! setup_subscriber {
         ($($transform:ident()).*) => {{
-            let fmt_layer = fmt_layer$(.$transform())*.with_filter(filter);
+            let fmt_layer = base_fmt_layer$(.$transform())*.with_filter(filter_layer);
             let subscriber = Registry::default()
                 .with(fmt_layer)
-                .with(tracking_layer.with_filter(filter));
-            tracing_core::Dispatch::new(subscriber)
+                .with(tracking_layer.with_filter(LevelFilter::from(max_level)));
+            (
+                tracing_core::Dispatch::new(subscriber),
+                reload_handle,
+                callback_arc.clone(),
+            )
         }};
     }
+
     use LogLineFormat::*;
     match (format, with_time) {
         (FULL, true) => setup_subscriber!(),
@@ -458,7 +484,24 @@ fn setup_log_line_subscriber(
     if !max_level.is_valid() {
         return Err(Error::generic("max_level out of range"));
     }
-    let dispatch = get_log_line_dispatch(
+
+    let new_callback = Arc::new(Mutex::new(callback));
+
+    if let Some(reload_handle) = &*RELOAD_HANDLE.lock().unwrap() {
+        if let Some(cb_arc) = &*LOG_LINE_CALLBACK.lock().unwrap() {
+            *cb_arc.lock().unwrap() = new_callback.lock().unwrap().clone();
+        }
+
+        return reload_handle
+            .reload(LevelFilter::from(max_level))
+            .map_err(|e| {
+                warn!("Failed to reload log level: {e}");
+                Error::generic(format!("Unable to reload subscriber: {e}"))
+            });
+    }
+
+    // First-time setup
+    let (dispatch, reload_handle, callback_arc) = get_log_line_dispatch(
         callback,
         max_level,
         format,
@@ -467,7 +510,19 @@ fn setup_log_line_subscriber(
         with_level,
         with_target,
     );
-    set_global_default(dispatch)
+
+    match set_global_default(dispatch.clone()) {
+        Ok(()) => {
+            *DISPATCH.lock().unwrap() = Some(dispatch);
+            *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
+            *LOG_LINE_CALLBACK.lock().unwrap() = Some(callback_arc);
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to set global default subscriber: {e}");
+            Err(Error::generic(format!("Unable to set global subscriber: {e}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -584,7 +639,7 @@ mod tests {
     fn info_logs_with_formatted_log_line_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
-        let dispatch = get_log_line_dispatch(
+        let (dispatch, _, _) = get_log_line_dispatch(
             record_callback,
             Level::INFO,
             LogLineFormat::COMPACT,
@@ -617,7 +672,7 @@ mod tests {
         })
     }
 
-    static EVENTS_OK: Mutex<Option<Vec<tracing::Level>>> = Mutex::new(None);
+    static EVENTS_OK: Mutex<Option<Vec<(String, tracing::Level)>>> = Mutex::new(None);
     fn setup_events() {
         *EVENTS_OK.lock().unwrap() = Some(vec![]);
     }
@@ -647,7 +702,27 @@ mod tests {
         if ok {
             let mut lock = EVENTS_OK.lock().unwrap();
             if let Some(ref mut events) = *lock {
-                events.push(convert_level(event.level));
+                events.push((msg.to_string(), convert_level(event.level)));
+            }
+        }
+    }
+
+    extern "C" fn event_callback_2(event: Event) {
+        let msg: &str = unsafe { TryFromStringSlice::try_from_slice(&event.message).unwrap() };
+        let target: &str = unsafe { TryFromStringSlice::try_from_slice(&event.target).unwrap() };
+        let file: &str = unsafe { TryFromStringSlice::try_from_slice(&event.file).unwrap() };
+
+        // file path will use \ on windows
+        use std::path::MAIN_SEPARATOR;
+        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+
+        let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
+            && file == expected_file
+            && (msg == "Testing 2");
+        if ok {
+            let mut lock = EVENTS_OK.lock().unwrap();
+            if let Some(ref mut events) = *lock {
+                events.push((msg.to_string(), convert_level(event.level)));
             }
         }
     }
@@ -656,7 +731,7 @@ mod tests {
     fn trace_event_tracking() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
-        let (dispatch, _filter) = get_event_dispatcher(event_callback, Level::TRACE);
+        let (dispatch, _filter, _) = get_event_dispatcher(event_callback, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1", "Another line"];
             for line in lines {
@@ -666,8 +741,9 @@ mod tests {
         let lock = EVENTS_OK.lock().unwrap();
         if let Some(ref results) = *lock {
             assert!(!results.is_empty(), "No events were captured");
+
             assert!(
-                results.iter().all(|lvl| *lvl == tracing::Level::INFO),
+                results.iter().all(|(_msg, lvl)| *lvl == tracing::Level::INFO),
                 "Not all events were INFO"
             );
         } else {
@@ -695,21 +771,27 @@ mod tests {
             if let Some(ref results) = *lock {
                 assert!(!results.is_empty(), "No events were captured");
                 assert!(
-                    results.iter().all(|lvl| *lvl == tracing::Level::INFO
+                    results.iter().all(|(_msg, lvl)| *lvl == tracing::Level::INFO
                         || *lvl == tracing::Level::WARN
                         || *lvl == tracing::Level::DEBUG),
                     "Not all events were INFO or WARN or DEBUG"
                 );
                 assert!(
-                    results.contains(&tracing::Level::INFO),
+                    results
+                        .iter()
+                        .all(|(msg, _lvl)| *msg == "Testing 1" || *msg == "Another line"),
+                    "Not all messages are Testing 1 or Another line"
+                );
+                assert!(
+                    results.iter().any(|(_msg, lvl)| *lvl == tracing::Level::INFO),
                     "No INFO events found"
                 );
                 assert!(
-                    results.contains(&tracing::Level::WARN),
+                    results.iter().any(|(_msg, lvl)| *lvl == tracing::Level::WARN),
                     "No WARN events found"
                 );
                 assert!(
-                    results.contains(&tracing::Level::DEBUG),
+                    results.iter().any(|(_msg, lvl)| *lvl == tracing::Level::DEBUG),
                     "No DEBUG events found"
                 );
             } else {
@@ -717,8 +799,15 @@ mod tests {
             }
         }
         setup_events();
-        let result = setup_event_subscriber(event_callback, Level::INFO);
+        let result = setup_event_subscriber(event_callback_2, Level::INFO);
         assert!(result.is_ok());
+        for line in lines {
+            warn!("{line}");
+            info!("{line}");
+            debug!("{line}");
+            trace!("{line}");
+        }
+        let lines = ["Testing 2", "Another line"];
         for line in lines {
             warn!("{line}");
             info!("{line}");
@@ -731,15 +820,21 @@ mod tests {
                 assert!(
                     results
                         .iter()
-                        .all(|lvl| *lvl == tracing::Level::INFO || *lvl == tracing::Level::WARN),
+                        .all(|(_msg, lvl)| *lvl == tracing::Level::INFO || *lvl == tracing::Level::WARN),
                     "Not all events were INFO or WARN"
                 );
                 assert!(
-                    results.contains(&tracing::Level::INFO),
+                    results
+                        .iter()
+                        .all(|(msg, _lvl)| *msg == "Testing 2"),
+                    "Not all messages are Testing 2"
+                );
+                assert!(
+                    results.iter().any(|(_msg, lvl)| *lvl == tracing::Level::INFO),
                     "No INFO events found"
                 );
                 assert!(
-                    results.contains(&tracing::Level::WARN),
+                    results.iter().any(|(_msg, lvl)| *lvl == tracing::Level::WARN),
                     "No WARN events found"
                 );
             } else {
