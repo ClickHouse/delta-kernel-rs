@@ -260,9 +260,13 @@ mod tests {
     };
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
+    #[cfg(feature = "arrow-55")]
+    use crate::object_store::PutMultipartOptions;
+    #[cfg(not(feature = "arrow-55"))]
+    use crate::object_store::PutMultipartOpts;
     use crate::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
+        PutPayload, PutResult, Result,
     };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
@@ -310,7 +314,7 @@ mod tests {
             let mut seen = HashSet::new();
             for key in ordered_keys.iter() {
                 if !seen.insert(key) {
-                    panic!("Duplicate key in OrderedGetStore: {}", key);
+                    panic!("Duplicate key in OrderedGetStore: {key}");
                 }
             }
 
@@ -355,7 +359,8 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOpts,
+            #[cfg(not(feature = "arrow-55"))] opts: PutMultipartOpts,
+            #[cfg(feature = "arrow-55")] opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -571,7 +576,7 @@ mod tests {
         // note we don't want to go over 1000 since we only buffer 1000 requests at a time
         let num_paths = 1000;
         let ordered_paths: Vec<Path> = (0..num_paths)
-            .map(|i| Path::from(format!("/test/path{}", i)))
+            .map(|i| Path::from(format!("/test/path{i}")))
             .collect();
         let jumbled_paths: Vec<_> = ordered_paths[100..400]
             .iter()
@@ -583,7 +588,7 @@ mod tests {
         let memory_store = InMemory::new();
         for (i, path) in ordered_paths.iter().enumerate() {
             memory_store
-                .put(path, Bytes::from(format!("content_{}", i)).into())
+                .put(path, Bytes::from(format!("content_{i}")).into())
                 .await
                 .unwrap();
         }
@@ -632,7 +637,7 @@ mod tests {
         // 2. we then set up an ObjectStore to resolves those paths in a jumbled order
         // 3. then call read_json_files and check that the results are in order
         let ordered_paths: Vec<Path> = (0..1000)
-            .map(|i| Path::from(format!("test/path{}", i)))
+            .map(|i| Path::from(format!("test/path{i}")))
             .collect();
 
         let test_list: &[(usize, Vec<Path>)] = &[
@@ -680,7 +685,7 @@ mod tests {
                 .map(|path| {
                     let store = store.clone();
                     async move {
-                        let url = Url::parse(&format!("memory:/{}", path)).unwrap();
+                        let url = Url::parse(&format!("memory:/{path}")).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
                         let meta_size = meta.size;
@@ -801,7 +806,7 @@ mod tests {
                 Err(Error::FileAlreadyExists(err_path)) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
-                _ => panic!("Expected FileAlreadyExists error, got: {:?}", result),
+                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
             }
         }
 

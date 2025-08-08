@@ -48,7 +48,7 @@ impl DataFileMetadata {
         Self { file_meta }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'write_metadata' schema
+    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -62,7 +62,7 @@ impl DataFileMetadata {
                     size,
                 },
         } = self;
-        let write_metadata_schema = crate::transaction::get_write_metadata_schema();
+        let add_files_schema = crate::transaction::add_files_schema();
 
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -78,7 +78,7 @@ impl DataFileMetadata {
             builder.keys().append_value(k);
             builder.values().append_value(v);
         }
-        builder.append(true).unwrap();
+        builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
         let size: i64 = (*size)
@@ -88,7 +88,7 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(write_metadata_schema.as_ref().try_into_arrow()?),
+            Arc::new(add_files_schema.as_ref().try_into_arrow()?),
             vec![path, partitions, size, modification_time, data_change],
         )?)))
     }
@@ -137,8 +137,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
             return Err(Error::generic(format!(
-                "Path must end with a trailing slash: {}",
-                path
+                "Path must end with a trailing slash: {path}"
             )));
         }
         let path = path.join(&name)?;
@@ -166,10 +165,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [write metadata] schema (where `<uuid>` is
-    /// a generated UUIDv4).
+    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
+    /// is a generated UUIDv4).
     ///
-    /// [write metadata]: crate::transaction::get_write_metadata_schema
+    /// [add file metadata]: crate::transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
@@ -410,6 +409,8 @@ mod tests {
 
     use itertools::Itertools;
 
+    use crate::utils::test_utils::assert_result_error_with_message;
+
     use super::*;
 
     fn into_record_batch(
@@ -478,7 +479,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::get_write_metadata_schema()
+            crate::transaction::add_files_schema()
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
@@ -600,9 +601,11 @@ mod tests {
             .unwrap(),
         ));
 
-        assert!(parquet_handler
-            .write_parquet(&Url::parse("memory:///data").unwrap(), data)
-            .await
-            .is_err());
+        assert_result_error_with_message(
+            parquet_handler
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+                .await,
+            "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
+        );
     }
 }
