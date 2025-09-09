@@ -1,8 +1,15 @@
 //! Expression handling based on arrow-rs compute kernels.
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use itertools::Itertools;
+
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Datum, NullBufferBuilder, RecordBatch, StringArray,
+    StructArray,
 };
+use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -11,6 +18,8 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::arrow::json::writer::{make_encoder, EncoderOptions};
+use crate::arrow::json::StructMode;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -19,12 +28,10 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
-    Predicate, Scalar, Transform, UnaryPredicate, UnaryPredicateOp,
+    Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
+    UnaryPredicateOp,
 };
 use crate::schema::{DataType, StructType};
-use itertools::Itertools;
-use std::borrow::Cow;
-use std::sync::Arc;
 
 pub(super) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
@@ -120,18 +127,14 @@ fn evaluate_transform_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    let mut used_insertion_keys = 0;
-    let mut used_replacement_keys = 0;
+    let mut used_field_transforms = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
     let mut output_cols = Vec::new();
 
     // Handle prepends (insertions before any field)
-    if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
-        for expr in prepend_exprs {
-            output_cols.push(evaluate_expression(expr, batch, None)?);
-        }
-        used_insertion_keys += 1;
+    for expr in &transform.prepended_fields {
+        output_cols.push(evaluate_expression(expr, batch, None)?);
     }
 
     // Extract the input path, if any
@@ -150,41 +153,31 @@ fn evaluate_transform_expression(
 
     // Process each input field in order (unified logic for both cases)
     for input_field in source_data.schema_fields() {
-        let field_name = input_field.name().as_ref();
+        let field_name: &str = input_field.name();
 
-        // Handle the field based on replacement rules
-        if let Some(replacement) = transform.field_replacements.get(field_name) {
-            if let Some(expr) = replacement {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
-            } // else no replacement => dropped
-            used_replacement_keys += 1;
-        } else {
-            // Field passes through unchanged - extract based on source type
+        // Any field that isn't replaced passes through unchanged
+        let field_transform = transform.field_transforms.get(field_name);
+        if !field_transform.is_some_and(|t| t.is_replace) {
             output_cols.push(extract_column(source_data, &[field_name])?);
         }
 
-        // Handle insertions after this input field
-        let field_name = Some(Cow::Borrowed(field_name));
-        if let Some(insertion_exprs) = transform.field_insertions.get(&field_name) {
-            for expr in insertion_exprs {
+        // Process any insertions that come after this field
+        if let Some(field_transform) = field_transform {
+            for expr in &field_transform.exprs {
                 output_cols.push(evaluate_expression(expr, batch, None)?);
             }
-            used_insertion_keys += 1;
+            used_field_transforms += 1;
         }
     }
 
-    // Validate all transforms were used
-    if used_insertion_keys != transform.field_insertions.len() {
+    // Verify that all field transforms were used
+    if used_field_transforms != transform.field_transforms.len() {
         return Err(Error::generic(
-            "Some insertion keys don't reference valid input field names",
-        ));
-    }
-    if used_replacement_keys != transform.field_replacements.len() {
-        return Err(Error::generic(
-            "Some replacement keys don't reference valid input field names",
+            "Some field transforms reference invalid input field names",
         ));
     }
 
+    // Verify that the lengths match before attempting to zip them below.
     if output_cols.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
             "Expression count ({}) doesn't match output schema field count ({})",
@@ -216,6 +209,7 @@ pub fn evaluate_expression(
 ) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
+    use UnaryExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
@@ -238,6 +232,15 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
+        (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
+            None | Some(&DataType::STRING) => {
+                let input = evaluate_expression(expr, batch, None)?;
+                Ok(to_json(&input)?)
+            }
+            Some(data_type) => Err(Error::generic(format!(
+                "ToJson operator requires STRING output, but got {data_type:?}"
+            ))),
+        },
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -411,6 +414,69 @@ pub fn evaluate_predicate(
     }
 }
 
+/// Converts a StructArray to JSON-encoded strings
+pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+    let (array_ref, _is_scalar) = input.get();
+    match array_ref.data_type() {
+        ArrowDataType::Struct(_) => {
+            let struct_array = array_ref.as_struct_opt().ok_or_else(|| {
+                ArrowError::InvalidArgumentError(format!(
+                    "Failed to convert {} to StructArray",
+                    array_ref.data_type(),
+                ))
+            })?;
+
+            let num_rows = struct_array.len();
+            if num_rows == 0 {
+                return Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())));
+            }
+
+            // Create the encoder using make_encoder with "struct mode" (not "list mode")
+            let field = Arc::new(ArrowField::new_struct(
+                "root",
+                struct_array.fields().iter().cloned().collect_vec(),
+                true,
+            ));
+            let options = EncoderOptions::default().with_struct_mode(StructMode::ObjectOnly);
+            let mut encoder = make_encoder(&field, struct_array, &options)?;
+
+            // Pre-allocate the various buffers
+            const ROW_SIZE_ESTIMATE: usize = 64;
+            let mut data = Vec::with_capacity(num_rows * ROW_SIZE_ESTIMATE);
+            let mut offsets = Vec::with_capacity(num_rows + 1);
+            offsets.push(0);
+            let mut nulls = NullBufferBuilder::new(num_rows);
+
+            for i in 0..num_rows {
+                if struct_array.is_null(i) {
+                    nulls.append_null();
+                } else {
+                    encoder.encode(i, &mut data);
+                    nulls.append_non_null();
+                }
+
+                // We have to set a valid physical offset even if the entry was null.
+                // But it will refer to a 0-byte slice, since we didn't encode any new data.
+                let offset = i32::try_from(data.len()).map_err(|_| {
+                    ArrowError::InvalidArgumentError("Failed to convert offset".to_string())
+                })?;
+                offsets.push(offset);
+            }
+
+            let array = StringArray::try_new(
+                OffsetBuffer::new(offsets.into()),
+                data.into(),
+                nulls.finish(),
+            )?;
+            Ok(Arc::new(array))
+        }
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "TO_JSON can only be applied to struct arrays, got {:?}",
+            array_ref.data_type()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,7 +551,7 @@ mod tests {
         let batch = create_test_batch();
 
         // Test 1: Empty transform (identity) - should be exactly equal to input
-        let transform = Transform::new();
+        let transform = Transform::new_top_level();
         let output_schema = StructType::new(vec![
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
@@ -510,7 +576,7 @@ mod tests {
 
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
-        let transform_nested = Transform::new().with_input_path(["nested"]);
+        let transform_nested = Transform::new_nested(["nested"]);
 
         let nested_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -550,35 +616,15 @@ mod tests {
     fn test_field_operations_and_multiple_insertions() {
         let batch = create_test_batch();
 
-        let mut transform = Transform::new();
-
-        // Replace field 'a' with column reference to 'b'
-        transform
-            .field_replacements
-            .insert("a".to_string(), Some(column_expr_ref!("b")));
-
-        // Drop field 'b'
-        transform.field_replacements.insert("b".to_string(), None);
-
-        // Multiple prepends (multiple insertions at same position)
-        transform.field_insertions.insert(
-            None,
-            vec![
-                Expr::literal(1).into(),
-                Expr::literal(2).into(),
-                column_expr_ref!("c"),
-            ],
-        );
-
-        // Multiple insertions after 'c' (key feature: multiple at same position)
-        transform.field_insertions.insert(
-            Some(Cow::Borrowed("c")),
-            vec![
-                Expr::literal(42).into(),
-                column_expr_ref!("a"), // references original column a
-                Expr::literal(99).into(),
-            ],
-        );
+        let transform = Transform::new_top_level()
+            .with_replaced_field("a", column_expr_ref!("b"))
+            .with_dropped_field("b")
+            .with_inserted_field(None::<&str>, Expr::literal(1).into())
+            .with_inserted_field(None::<&str>, Expr::literal(2).into())
+            .with_inserted_field(None::<&str>, column_expr_ref!("c"))
+            .with_inserted_field(Some("c"), Expr::literal(42).into())
+            .with_inserted_field(Some("c"), column_expr_ref!("a"))
+            .with_inserted_field(Some("c"), Expr::literal(99).into());
 
         let output_schema = StructType::new(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
@@ -625,7 +671,7 @@ mod tests {
         let nested_batch = create_nested_test_batch();
 
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
-        let transform_copy = Transform::new().with_input_path(["nested"]);
+        let transform_copy = Transform::new_nested(["nested"]);
 
         let copy_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -657,17 +703,9 @@ mod tests {
         }
 
         // Test 2: Modify nested struct and relocate it
-        let mut transform_modify = Transform::new().with_input_path(["nested"]);
-
-        // Replace 'x' field with a literal value
-        transform_modify
-            .field_replacements
-            .insert("x".to_string(), Some(Expr::literal(777).into()));
-
-        // Insert a new field after 'y'
-        transform_modify
-            .field_insertions
-            .insert(Some(Cow::Borrowed("y")), vec![Expr::literal(555).into()]);
+        let transform_modify = Transform::new_nested(["nested"])
+            .with_replaced_field("x".to_string(), Expr::literal(777).into())
+            .with_inserted_field(Some("y"), Expr::literal(555).into());
 
         let modify_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
@@ -705,7 +743,8 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let transform = Transform::new().with_replaced_field("missing", Expr::literal(1).into());
+        let transform =
+            Transform::new_top_level().with_replaced_field("missing", Expr::literal(1).into());
         let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
 
         let expr = Expr::Transform(transform);
@@ -714,15 +753,14 @@ mod tests {
             &batch,
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("replacement keys"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test unused insertion keys
-        let mut transform2 = Transform::new();
-        transform2.field_insertions.insert(
-            Some(Cow::Borrowed("nonexistent")),
-            vec![Expr::literal(1).into()],
-        );
+        let transform2 = Transform::new_top_level()
+            .with_inserted_field(Some("nonexistent"), Expr::literal(1).into());
 
         let expr2 = Expr::Transform(transform2);
         let result2 = evaluate_expression(
@@ -731,10 +769,13 @@ mod tests {
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().to_string().contains("insertion keys"));
+        assert!(result2
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test column count mismatch
-        let transform3 = Transform::new().with_dropped_field("a");
+        let transform3 = Transform::new_top_level().with_dropped_field("a");
 
         let wrong_output_schema = StructType::new(vec![
             StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped
@@ -755,7 +796,7 @@ mod tests {
             .contains("Expression count"));
 
         // Test missing output schema
-        let transform4 = Transform::new();
+        let transform4 = Transform::new_top_level();
         let expr4 = Expr::Transform(transform4);
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());

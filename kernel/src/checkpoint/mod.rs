@@ -45,8 +45,9 @@
 //!
 //! let engine: &dyn Engine = todo!(); /* create engine instance */
 //!
-//! // Create a snapshot for the table at the version you want to checkpoint (None = latest)
-//! let snapshot = Arc::new(Snapshot::try_from_uri("./tests/data/app-txn-no-checkpoint", engine, None)?);
+//! // Create a snapshot for the table at the version you want to checkpoint
+//! let url = delta_kernel::try_parse_uri("./tests/data/app-txn-no-checkpoint")?;
+//! let snapshot = Arc::new(Snapshot::builder(url).build(engine)?);
 //!
 //! // Create a checkpoint writer from the snapshot
 //! let mut writer = snapshot.checkpoint()?;
@@ -82,7 +83,7 @@
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
@@ -90,12 +91,12 @@ use crate::actions::{
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
-use crate::last_checkpoint_hint::LAST_CHECKPOINT_FILE_NAME;
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::Snapshot;
-use crate::utils::calculate_transaction_expiration_timestamp;
+use crate::utils::{calculate_transaction_expiration_timestamp, current_time_duration};
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
@@ -333,11 +334,7 @@ impl CheckpointWriter {
             size_in_bytes,
         );
 
-        let last_checkpoint_path = self
-            .snapshot
-            .log_segment()
-            .log_root
-            .join(LAST_CHECKPOINT_FILE_NAME)?;
+        let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         engine.json_handler().write_json_file(
@@ -406,12 +403,7 @@ impl CheckpointWriter {
             .table_properties()
             .deleted_file_retention_duration;
 
-        deleted_file_retention_timestamp_with_time(
-            retention_duration,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to calculate system time: {e}")))?,
-        )
+        deleted_file_retention_timestamp_with_time(retention_duration, current_time_duration()?)
     }
 }
 
