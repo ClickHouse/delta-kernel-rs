@@ -1,9 +1,9 @@
 use std::sync::LazyLock;
 use std::{path::PathBuf, sync::Arc};
 
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use futures::executor::block_on;
 use itertools::Itertools;
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_log::test;
 use url::Url;
 
@@ -17,6 +17,7 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::parquet::arrow::ArrowWriter;
@@ -24,7 +25,6 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
-use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
@@ -225,7 +225,8 @@ fn build_snapshot_with_uuid_checkpoint_parquet() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -254,7 +255,8 @@ fn build_snapshot_with_uuid_checkpoint_json() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -296,7 +298,8 @@ fn build_snapshot_with_correct_last_uuid_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -332,7 +335,8 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -371,7 +375,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -413,7 +418,8 @@ fn build_snapshot_with_correct_last_multipart_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -456,7 +462,7 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None);
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None);
     assert_result_error_with_message(
         log_segment,
         "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
@@ -493,7 +499,7 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None);
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None);
     assert_result_error_with_message(
         log_segment,
         "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
@@ -524,7 +530,8 @@ fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
 
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
@@ -570,7 +577,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -603,7 +611,7 @@ fn build_snapshot_without_checkpoints() {
 
     ///////// Specify no checkpoint or end version /////////
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -616,7 +624,8 @@ fn build_snapshot_without_checkpoints() {
     assert_eq!(versions, expected_versions);
 
     ///////// Specify  only end version /////////
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, Some(2)).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, Some(2)).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -657,8 +666,13 @@ fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         None,
     );
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, Some(4)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        Some(checkpoint_metadata),
+        Some(4),
+    )
+    .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -695,8 +709,13 @@ fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         Some(&checkpoint_metadata),
     );
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, Some(4)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        Some(checkpoint_metadata),
+        Some(4),
+    )
+    .unwrap();
 
     assert_eq!(log_segment.checkpoint_parts[0].version, 3);
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
@@ -983,14 +1002,14 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
 
     // Create the stream over checkpoint batches.
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(
                 "file:///00000000000000000001.checkpoint.parquet",
             )],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1014,14 +1033,14 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
 
     // Create the stream over checkpoint batches.
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(
                 "file:///00000000000000000001.checkpoint.parquet",
             )],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1052,12 +1071,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_one_file)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1111,7 +1130,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![
@@ -1119,7 +1138,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
                 create_log_path(&checkpoint_two_file),
             ],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1165,12 +1184,12 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_one_file)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1211,12 +1230,12 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_one_file)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1278,12 +1297,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_file_path)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1352,7 +1371,8 @@ fn create_segment_for(
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
-    LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap()
+    LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), None, version_to_load)
+        .unwrap()
 }
 
 #[test]
@@ -1367,7 +1387,7 @@ fn test_list_log_files_with_version() -> DeltaResult<()> {
         ],
         None,
     );
-    let result = list_log_files_with_version(storage.as_ref(), &log_root, Some(0), None)?;
+    let result = ListedLogFiles::list(storage.as_ref(), &log_root, Some(0), None)?;
     let latest_crc = result.latest_crc_file.unwrap();
     assert_eq!(
         latest_crc.location.location.path(),
@@ -1708,7 +1728,7 @@ fn test_commit_cover_minimal_overlap() {
 #[test]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_in_order_compaction_files() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![
             create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
@@ -1723,7 +1743,7 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![
             create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
@@ -1738,7 +1758,7 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![],
         vec![
@@ -1753,7 +1773,7 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![],
         vec![
@@ -2005,4 +2025,46 @@ fn for_timestamp_conversion_no_commit_files() {
 
     let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
     assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
+}
+
+#[test]
+fn test_log_segment_contiguous_commit_files() {
+    let res = ListedLogFiles::try_new(
+        vec![
+            create_log_path("file:///00000000000000000001.json"),
+            create_log_path("file:///00000000000000000002.json"),
+            create_log_path("file:///00000000000000000003.json"),
+        ],
+        vec![],
+        vec![],
+        None,
+    );
+    assert!(res.is_ok());
+
+    // allow gaps in ListedLogFiles
+    let listed = ListedLogFiles::try_new(
+        vec![
+            create_log_path("file:///00000000000000000001.json"),
+            create_log_path("file:///00000000000000000003.json"),
+        ],
+        vec![],
+        vec![],
+        None,
+    );
+
+    // disallow gaps in LogSegment
+    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
+    assert_result_error_with_message(
+        log_segment,
+        "Generic delta kernel error: Expected ordered \
+        contiguous commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \
+        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
+        None, path: \"/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
+        0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
+        file_type: Commit }, ParsedLogPath { location: FileMeta { location: Url { scheme: \
+        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
+        None, path: \"/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
+        0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
+        file_type: Commit }]",
+    );
 }

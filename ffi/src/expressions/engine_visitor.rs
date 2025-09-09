@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    Expression, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
+    Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
     OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate, Scalar, StructData,
     UnaryPredicate, UnaryPredicateOp,
 };
@@ -323,7 +323,7 @@ fn visit_expression_struct_literal(
 
 fn visit_expression_struct(
     visitor: &mut EngineExpressionVisitor,
-    exprs: &[Expression],
+    exprs: &[ExpressionRef],
     sibling_list_id: usize,
 ) {
     let child_list_id = call!(visitor, make_field_list, exprs.len());
@@ -481,6 +481,11 @@ fn visit_expression_impl(
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
+        }
+        Expression::Transform(_) => {
+            // Minimal FFI support: Transform expressions are treated as unknown
+            // TODO: Implement full Transform FFI support in future version
+            visit_unknown(visitor, sibling_list_id, "Transform")
         }
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
