@@ -103,11 +103,26 @@ pub unsafe extern "C" fn free_table_changes(table_changes: Handle<ExclusiveTable
 ///
 /// Caller is responsible for passing a valid table changes handle.
 #[no_mangle]
-pub unsafe extern "C" fn schema(
+pub unsafe extern "C" fn table_changes_schema(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> Handle<SharedSchema> {
     let table_changes = unsafe { table_changes.as_ref() };
     Arc::new(table_changes.schema().clone()).into()
+}
+
+/// Get table root from the specified TableChanges.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid table changes handle.
+#[no_mangle]
+pub unsafe extern "C" fn table_changes_table_root(
+    table_changes: Handle<ExclusiveTableChanges>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let table_changes = unsafe { table_changes.as_ref() };
+    let table_root = table_changes.table_root().to_string();
+    allocate_fn(kernel_string_slice!(table_root))
 }
 
 /// Get start version from the specified TableChanges.
@@ -116,7 +131,9 @@ pub unsafe extern "C" fn schema(
 ///
 /// Caller is responsible for passing a valid table changes handle.
 #[no_mangle]
-pub unsafe extern "C" fn start_version(table_changes: Handle<ExclusiveTableChanges>) -> u64 {
+pub unsafe extern "C" fn table_changes_start_version(
+    table_changes: Handle<ExclusiveTableChanges>,
+) -> u64 {
     let table_changes = unsafe { table_changes.as_ref() };
     table_changes.start_version()
 }
@@ -127,7 +144,9 @@ pub unsafe extern "C" fn start_version(table_changes: Handle<ExclusiveTableChang
 ///
 /// Caller is responsible for passing a valid table changes handle.
 #[no_mangle]
-pub unsafe extern "C" fn end_version(table_changes: Handle<ExclusiveTableChanges>) -> u64 {
+pub unsafe extern "C" fn table_changes_end_version(
+    table_changes: Handle<ExclusiveTableChanges>,
+) -> u64 {
     let table_changes = unsafe { table_changes.as_ref() };
     table_changes.end_version()
 }
@@ -278,16 +297,12 @@ fn table_changes_scan_iter_init_impl(
 #[no_mangle]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
-    engine_context: NullableCvoid,
 ) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
-    scan_table_changes_next_impl(data, engine_context).into_extern_result(&data.engine.as_ref())
+    scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
 }
 
-fn scan_table_changes_next_impl(
-    data: &ScanTableChangesIterator,
-    engine_context: NullableCvoid,
-) -> DeltaResult<*mut ArrowFFIData> {
+fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
     let mut data = data
         .data
         .lock()
@@ -320,60 +335,169 @@ fn scan_table_changes_next_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    //use super::{free_expression_evaluator, new_expression_evaluator};
-    //use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
-    use crate::engine_to_handle;
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
-        recover_string, EngineErrorWithMessage,
+        allocate_err, allocate_str, ok_or_panic, recover_string, EngineErrorWithMessage,
     };
-    use crate::{
-        kernel_string_slice, snapshot, snapshot_at_version, version, KernelStringSlice,
-        SharedSchema,
-    };
+    use crate::{engine_to_handle, kernel_string_slice};
+
+    use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
+    use delta_kernel::arrow::datatypes::{Field, Schema};
+    use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::arrow::util::pretty::pretty_format_batches;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-    use delta_kernel::{
-        schema::{DataType, StructField, StructType},
-        Expression,
-    };
-    use object_store::memory::InMemory;
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::Engine;
+    use delta_kernel_ffi::engine_data::get_engine_data;
+    use itertools::Itertools;
+    use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
-    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+    use test_utils::{
+        actions_to_string_with_metadata, add_commit, generate_simple_batch, record_batch_to_bytes,
+        to_arrow, TestAction,
+    };
+
+    const PARQUET_FILE1: &str =
+        "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
+    const PARQUET_FILE2: &str =
+        "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
+
+    pub const METADATA: &str = r#"
+    {"commitInfo": {
+        "timestamp": 1587968586154,
+        "operation": "WRITE",
+        "operationParameters": {
+        "mode": "ErrorIfExists",
+        "partitionBy": "[]"
+        },
+        "isBlindAppend": true
+    }}
+    {"protocol": {
+        "minReaderVersion": 1,
+        "minWriterVersion": 2
+    }}
+    {"metaData": {
+        "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        "format": {
+        "provider": "parquet",
+        "options": {}
+        },
+        "schemaString": "{
+        \"type\": \"struct\",
+        \"fields\": [
+            {
+            \"name\": \"id\",
+            \"type\": \"integer\",
+            \"nullable\": true,
+            \"metadata\": {}
+            },
+            {
+            \"name\": \"val\",
+            \"type\": \"string\",
+            \"nullable\": true,
+            \"metadata\": {}
+            }
+        ]
+        }",
+        "partitionColumns": [],
+        "configuration": {
+        "delta.enableChangeDataFeed": "true"
+        },
+        "createdTime": 1587968585495
+    }}
+    "#;
+
+    async fn commit_file(
+        storage: &dyn ObjectStore,
+        version: u64,
+        file: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        add_commit(
+            storage,
+            version,
+            actions_to_string_with_metadata(
+                vec![TestAction::Metadata, TestAction::Add(file)],
+                METADATA,
+            ),
+        )
+        .await
+    }
+
+    async fn put_file(
+        storage: &dyn ObjectStore,
+        file: String,
+        batch: &RecordBatch
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        storage
+            .put(
+                &Path::from(file),
+                record_batch_to_bytes(&batch).into(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn read_scan(
+        scan: &TableChangesScan,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<Vec<RecordBatch>> {
+        let scan_results = scan.execute(engine)?;
+        scan_results
+            .map(|scan_result| -> DeltaResult<_> {
+                let scan_result = scan_result?;
+                let mask = scan_result.full_mask();
+                let data = scan_result.raw_data?;
+                let record_batch = to_arrow(data)?;
+                if let Some(mask) = mask {
+                    Ok(filter_record_batch(&record_batch, &mask.into())?)
+                } else {
+                    Ok(record_batch)
+                }
+            })
+            .try_collect()
+    }
 
     #[tokio::test]
     async fn test_table_changes() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        add_commit(
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
+        commit_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+
+        let batch = generate_simple_batch()?;
+        put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
+        put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
+
+        let path = "memory:///";
         let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
-        //let snapshot1 =
-        //    unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
-        //let version1 = unsafe { version(snapshot1.shallow_copy()) };
-        //assert_eq!(version1, 0);
+        let table_changes = unsafe {
+            table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
+        };
 
-        //// Test getting snapshot at version
-        //let snapshot2 = unsafe {
-        //    ok_or_panic(snapshot_at_version(
-        //        kernel_string_slice!(path),
-        //        engine.shallow_copy(),
-        //        0,
-        //    ))
-        //};
-        //let version2 = unsafe { version(snapshot2.shallow_copy()) };
-        //assert_eq!(version2, 0);
-
-        let table_changes =
-            unsafe { table_changes_from_version(kernel_string_slice!(path), engine, 1) };
         match table_changes {
-            ExternResult::Ok(handle) => {
-                assert_eq!(unsafe { start_version(handle) }, 0);
+            ExternResult::Ok(ref handle) => {
+                assert_eq!(
+                    unsafe { table_changes_start_version(handle.shallow_copy()) },
+                    0
+                );
+                assert_eq!(
+                    unsafe { table_changes_end_version(handle.shallow_copy()) },
+                    1
+                );
+
+                let table_root =
+                    unsafe { table_changes_table_root(handle.shallow_copy(), allocate_str) };
+                assert_eq!(recover_string(table_root.unwrap()), path);
+
+                let schema = unsafe { table_changes_schema(handle.shallow_copy()).shallow_copy() };
+                let schema_ref = unsafe { schema.as_ref() };
+                assert_eq!(schema_ref.fields.len(), 5);
+                assert_eq!(schema_ref.fields[0].name, "id");
+                assert_eq!(schema_ref.fields[1].name, "val");
+                assert_eq!(schema_ref.fields[2].name, "_change_type");
+                assert_eq!(schema_ref.fields[3].name, "_commit_version");
+                assert_eq!(schema_ref.fields[4].name, "_commit_timestamp");
             }
             ExternResult::Err(e) => unsafe {
                 let err_with_msg: &EngineErrorWithMessage = &*(e as *mut EngineErrorWithMessage);
@@ -382,12 +506,194 @@ mod tests {
                     (*err_with_msg).etype,
                     (*err_with_msg).message
                 );
+                std::process::exit(1);
             },
         }
 
-        //unsafe { free_snapshot(snapshot1) }
-        //unsafe { free_snapshot(snapshot2) }
-        //unsafe { free_engine(engine) }
+        let table_changes = ok_or_panic(table_changes);
+        let table_changes_scan =
+            unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) };
+
+        match table_changes_scan {
+            ExternResult::Ok(ref handle) => {
+                let table_root =
+                    unsafe { table_changes_scan_table_root(handle.shallow_copy(), allocate_str) };
+                assert_eq!(recover_string(table_root.unwrap()), path);
+
+                let logical_schema = unsafe {
+                    table_changes_scan_logical_schema(handle.shallow_copy()).shallow_copy()
+                };
+                let logical_schema_ref = unsafe { logical_schema.as_ref() };
+                assert_eq!(logical_schema_ref.fields.len(), 5);
+                assert_eq!(logical_schema_ref.fields[0].name, "id");
+                assert_eq!(logical_schema_ref.fields[1].name, "val");
+                assert_eq!(logical_schema_ref.fields[2].name, "_change_type");
+                assert_eq!(logical_schema_ref.fields[3].name, "_commit_version");
+                assert_eq!(logical_schema_ref.fields[4].name, "_commit_timestamp");
+
+                let physical_schema = unsafe {
+                    table_changes_scan_physical_schema(handle.shallow_copy()).shallow_copy()
+                };
+                let physical_schema_ref = unsafe { physical_schema.as_ref() };
+                assert_eq!(physical_schema_ref.fields.len(), 2);
+                assert_eq!(physical_schema_ref.fields[0].name, "id");
+                assert_eq!(physical_schema_ref.fields[1].name, "val");
+            }
+            ExternResult::Err(e) => unsafe {
+                let err_with_msg: &EngineErrorWithMessage = &*(e as *mut EngineErrorWithMessage);
+                eprintln!(
+                    "Error type: {:?}, message: {:?}",
+                    (*err_with_msg).etype,
+                    (*err_with_msg).message
+                );
+                std::process::exit(1);
+            },
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_changes_scan() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        commit_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+
+        let batch = generate_simple_batch()?;
+        put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
+        put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
+
+        let path = "memory:///";
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+
+        let table_changes = ok_or_panic(unsafe {
+            table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
+        });
+        let table_changes_scan =
+            ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
+        let batches = unsafe {
+            read_scan(
+                &table_changes_scan.into_inner(),
+                engine.into_inner().engine(),
+            )
+        };
+        let batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
+
+        let filtered_batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|batch| {
+                let schema = batch.schema();
+                let keep_indices: Vec<usize> = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, field)| {
+                        if field.name() != "_commit_timestamp" {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let columns: Vec<ArrayRef> = keep_indices
+                    .iter()
+                    .map(|&i| batch.column(i).clone())
+                    .collect();
+
+                let fields: Vec<Arc<Field>> = keep_indices
+                    .iter()
+                    .map(|&i| Arc::new(schema.field(i).clone()))
+                    .collect();
+
+                let filtered_schema = Arc::new(Schema::new(fields));
+                RecordBatch::try_new(filtered_schema, columns).unwrap()
+            })
+            .collect();
+
+        let table_schema = Arc::new(StructType::new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("val", DataType::STRING),
+            StructField::nullable("_change_type", DataType::STRING),
+            StructField::nullable("_commit_version", DataType::INTEGER),
+        ]));
+        let expected = &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(table_schema.as_ref().try_into_arrow()?),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
+                Arc::new(StringArray::from(vec![
+                    "insert", "insert", "insert", "insert", "insert", "insert",
+                ])),
+                Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
+            ],
+        )?);
+
+        let formatted = pretty_format_batches(&filtered_batches)
+            .unwrap()
+            .to_string();
+        let expected = pretty_format_batches(&[expected.record_batch().clone()])
+            .unwrap()
+            .to_string();
+
+        println!("actual:\n{formatted}");
+        println!("expected:\n{expected}");
+        assert_eq!(formatted, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_changes_scan_iterator() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        commit_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+
+        let batch = generate_simple_batch()?;
+        put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
+        put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
+
+        let path = "memory:///";
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+
+        let table_changes = ok_or_panic(unsafe {
+            table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
+        });
+
+        let table_changes_scan =
+            ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
+
+        let table_changes_scan_iter = unsafe {
+            table_changes_scan_iter_init(table_changes_scan.shallow_copy(), engine.shallow_copy())
+        };
+
+        match table_changes_scan_iter {
+            ExternResult::Ok(ref _handle) => {}
+            ExternResult::Err(e) => unsafe {
+                let err_with_msg: &EngineErrorWithMessage = &*(e as *mut EngineErrorWithMessage);
+                eprintln!(
+                    "Error type: {:?}, message: {:?}",
+                    (*err_with_msg).etype,
+                    (*err_with_msg).message
+                );
+                std::process::exit(1);
+            },
+        }
+
+        let table_changes_scan_iter = ok_or_panic(table_changes_scan_iter);
+        let data = ok_or_panic(unsafe { scan_table_changes_next(table_changes_scan_iter) });
+
+        let engine_data = unsafe {
+            let data_ref = &mut *data;
+            let array = std::mem::replace(&mut data_ref.array, FFI_ArrowArray::empty());
+            get_engine_data(array, &(*data).schema, engine.shallow_copy())
+        };
+        let engine_data = ok_or_panic(engine_data);
+        let record_batch = unsafe { to_arrow(engine_data.into_inner()) };
+        let formatted = pretty_format_batches(&[record_batch?]).unwrap().to_string();
+        println!("KSSENII {formatted}");
+
         Ok(())
     }
 }
