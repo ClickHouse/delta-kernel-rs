@@ -14,6 +14,8 @@ cpp_compat = true
 "feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
 "feature = default-engine-rustls" = "DEFINE_DEFAULT_ENGINE_RUSTLS"
 "feature = default-engine-base" = "DEFINE_DEFAULT_ENGINE_BASE"
+#"feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
+#"feature = sync-engine" = "DEFINE_SYNC_ENGINE"
 
 [export.mangle]
 remove_underscores = true
