@@ -509,9 +509,10 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<DeletionVectorDescriptor>> {
-    if let Some(storage_type) =
-        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?
-    {
+    let storage_type_opt: Option<String> =
+        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?;
+    if let Some(storage_type_str) = storage_type_opt {
+        let storage_type = storage_type_str.parse()?;
         let path_or_inline_dv: String =
             getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
         let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
@@ -685,7 +686,7 @@ mod tests {
 
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
     use crate::Engine;
 
@@ -696,8 +697,8 @@ mod tests {
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec![ReaderFeature::DeletionVectors]),
-            writer_features: Some(vec![WriterFeature::DeletionVectors]),
+            reader_features: Some(vec![TableFeature::DeletionVectors]),
+            writer_features: Some(vec![TableFeature::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
         Ok(())
@@ -1086,7 +1087,7 @@ mod tests {
         engine
             .evaluation_handler()
             .new_expression_evaluator(
-                get_log_schema().clone(),
+                get_commit_schema().clone(),
                 expression.into(),
                 InCommitTimestampVisitor::schema().into(),
             )
