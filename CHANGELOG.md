@@ -1,5 +1,31 @@
 # Changelog
 
+## [v0.19.2](https://github.com/delta-io/delta-kernel-rs/tree/v0.19.2/) (2026-01-30)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.19.1...v0.19.2)
+
+### 🐛 Bug Fixes
+
+1. fix: Include domain metadata in checkpoints ([#1718])
+
+This issue could cause **data corruption** if kernel is used to checkpoint a table with row-tracking
+enabled, as the row highwatermark is stored in a domain-metadata, and would therefore be lost during
+checkpointing. This would mean duplicate row-ids if the table is subsequently written to.
+
+[#1718]: https://github.com/delta-io/delta-kernel-rs/pull/1718
+
+
+## [v0.19.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.19.0/) (2026-01-20)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.19.0...v0.19.1)
+
+### 🐛 Bug Fixes
+
+1. fix: deadlock for `TokioMultiThreadExecutor` ([#1606]) (see [#1605] for a description of the issue)
+
+[#1606]: https://github.com/delta-io/delta-kernel-rs/pull/1606
+[#1605]: https://github.com/delta-io/delta-kernel-rs/issues/1605
+
 ## [v0.19.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.19.0/) (2025-12-19)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.2...v0.19.0)
