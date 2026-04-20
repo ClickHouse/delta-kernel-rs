@@ -1,20 +1,17 @@
 //! Definitions of errors that the delta kernel can encounter
 
-use std::{
-    backtrace::{Backtrace, BacktraceStatus},
-    convert::Infallible,
-    num::ParseIntError,
-    str::Utf8Error,
-};
-
-use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
-use crate::Version;
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::convert::Infallible;
+use std::num::ParseIntError;
+use std::str::Utf8Error;
 
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
-use object_store;
+use crate::object_store;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::ParseIntervalError;
+use crate::Version;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -96,6 +93,11 @@ pub enum Error {
     /// A column was requested, but not found
     #[error("{0}")]
     MissingColumn(String),
+
+    /// The connector-provided partition values are invalid (missing/extra/duplicate keys,
+    /// or a value type does not match the schema column type).
+    #[error("Invalid partition values: {0}")]
+    InvalidPartitionValues(String),
 
     /// A column was specified with a specific type, but it is not of that type
     #[error("Expected column type: {0}")]
@@ -192,6 +194,10 @@ pub enum Error {
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
+    /// Cannot write a version checksum (CRC) file for this snapshot
+    #[error("Checksum write unsupported: {0}")]
+    ChecksumWriteUnsupported(String),
+
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),
@@ -215,6 +221,10 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Validation error for file statistics (e.g., missing required clustering column stats)
+    #[error("Stats validation error: {0}")]
+    StatsValidation(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -239,6 +249,9 @@ impl Error {
     }
     pub fn unexpected_column_type(name: impl ToString) -> Self {
         Self::UnexpectedColumnType(name.to_string())
+    }
+    pub fn invalid_partition_values(msg: impl ToString) -> Self {
+        Self::InvalidPartitionValues(msg.to_string())
     }
     pub fn missing_data(name: impl ToString) -> Self {
         Self::MissingData(name.to_string())
@@ -302,6 +315,10 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn stats_validation(msg: impl ToString) -> Self {
+        Self::StatsValidation(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

@@ -72,7 +72,9 @@ uintptr_t convert_engine_to_kernel_literal(
       return result.ok;
     }
     case Null: {
-      ExternResultusize result = visit_expression_literal_null(state, allocate_error);
+      struct NullTypeInfo* nt = &lit->value.null_type;
+      ExternResultusize result = visit_expression_literal_null(
+          state, nt->type_tag, nt->precision, nt->scale, allocate_error);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_null failed", (Error*)result.err);
         free_error((Error*)result.err);
@@ -239,6 +241,13 @@ uintptr_t convert_engine_to_kernel_expression_item(
         .len = strlen(unknown->name)
       };
       return visit_expression_unknown(state, str_slice);
+    }
+    case MapToStruct: {
+      struct MapToStructExpr* m2s = (struct MapToStructExpr*)item.ref;
+      assert(m2s->child_expr.len == 1);
+      uintptr_t child = convert_engine_to_kernel_expression_item(
+          state, m2s->child_expr.list[0]);
+      return visit_expression_map_to_struct(state, child);
     }
     case Transform:
     case FieldTransform:

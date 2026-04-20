@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
@@ -20,7 +21,6 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
-use delta_kernel_derive::internal_api;
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -110,7 +110,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
-        let checkpoint_manifest_phase = match log_segment.checkpoint_parts.as_slice() {
+        let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
             [single_part] => Some(CheckpointManifestReader::try_new(
                 engine,
                 single_part,
@@ -120,6 +120,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         };
 
         let checkpoint_parts = log_segment
+            .listed
             .checkpoint_parts
             .iter()
             .map(|path| path.location.clone())
@@ -140,8 +141,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     ///
     /// # Returns
     /// - `Done`: All processing done sequentially - no parallel phase needed
-    /// - `Parallel`: Parallel phase needed. The resulting files may be processed
-    ///   in parallel.
+    /// - `Parallel`: Parallel phase needed. The resulting files may be processed in parallel.
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
@@ -205,7 +205,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::AfterPhase1ScanMetadata;
+    use crate::scan::AfterSequentialScanMetadata;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
@@ -240,14 +240,13 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = sequential.finish()?;
         match (expected_sidecars, result) {
-            (sidecars, AfterPhase1ScanMetadata::Done(_)) => {
+            (sidecars, AfterSequentialScanMetadata::Done) => {
                 assert!(
                     sidecars.is_empty(),
-                    "Expected Done but got sidecars {:?}",
-                    sidecars
+                    "Expected Done but got sidecars {sidecars:?}"
                 );
             }
-            (expected_sidecars, AfterSequential::Parallel { files, .. }) => {
+            (expected_sidecars, AfterSequentialScanMetadata::Parallel { files, .. }) => {
                 assert_eq!(
                     files.len(),
                     expected_sidecars.len(),
@@ -341,8 +340,8 @@ mod tests {
     fn test_sequential_checkpoint_no_commits() -> DeltaResult<()> {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
-            &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], // Add from commit 3
-            &[],                                                                      // No sidecars
+            &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], /* Add from commit 3 */
+            &[], // No sidecars
         )
     }
 }

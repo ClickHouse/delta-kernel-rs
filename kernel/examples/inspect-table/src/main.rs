@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+use std::process::ExitCode;
+use std::sync::LazyLock;
+
+use clap::{Parser, Subcommand};
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
@@ -13,12 +18,6 @@ use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{DeltaResult, Error, Snapshot};
-
-use std::collections::HashMap;
-use std::process::ExitCode;
-use std::sync::LazyLock;
-
-use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -214,10 +213,9 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::Actions { oldest_first } => {
             let actions_schema = get_all_actions_schema();
-            let actions =
-                snapshot
-                    .log_segment()
-                    .read_actions(&engine, actions_schema.clone(), None)?;
+            let actions = snapshot
+                .log_segment()
+                .read_actions(&engine, actions_schema.clone())?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {

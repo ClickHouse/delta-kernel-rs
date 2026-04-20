@@ -1,19 +1,20 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 
+use super::deletion_vector::DeletionVectorDescriptor;
+use super::set_transaction::is_set_txn_expired;
+use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::log_segment::DomainMetadataMap;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use super::deletion_vector::DeletionVectorDescriptor;
-use super::domain_metadata::DomainMetadataMap;
-use super::*;
 
 #[derive(Default)]
 #[internal_api]
@@ -42,6 +43,7 @@ impl RowVisitor for MetadataVisitor {
 #[derive(Default)]
 pub(crate) struct SelectionVectorVisitor {
     pub(crate) selection_vector: Vec<bool>,
+    pub(crate) num_filtered: u64,
 }
 
 /// A single non-nullable BOOL column
@@ -60,8 +62,11 @@ impl RowVisitor for SelectionVectorVisitor {
             ))
         );
         for i in 0..row_count {
-            self.selection_vector
-                .push(getters[0].get(i, "selectionvector.output")?);
+            let selected: bool = getters[0].get(i, "selectionvector.output")?;
+            if !selected {
+                self.num_filtered += 1;
+            }
+            self.selection_vector.push(selected);
         }
         Ok(())
     }
@@ -296,7 +301,6 @@ pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 /// `application_id` can be set. This bounds the memory required for the
 /// visitor to at most one entry and reduces the amount of processing
 /// required.
-///
 #[derive(Default, Debug)]
 #[internal_api]
 pub(crate) struct SetTransactionVisitor {
@@ -358,13 +362,8 @@ impl RowVisitor for SetTransactionVisitor {
                     .is_none_or(|requested| requested.eq(&app_id))
                 {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
-                    // Check retention: filter out transactions that are old
-                    // If last_updated is None, the transaction never expires
-                    match self.expiration_timestamp.zip(txn.last_updated) {
-                        Some((expiration_ts, last_updated)) if last_updated <= expiration_ts => {
-                            continue
-                        }
-                        _ => (),
+                    if is_set_txn_expired(self.expiration_timestamp, txn.last_updated) {
+                        continue;
                     }
                     if !self.set_transactions.contains_key(&txn.app_id) {
                         self.set_transactions.insert(txn.app_id.clone(), txn);
@@ -429,17 +428,19 @@ impl RowVisitor for SidecarVisitor {
 /// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
 ///
 /// This visitor maintains the first entry for each domain it encounters. A domain_filter may be
-/// included to only retain the domain metadata for a specific domain (in order to bound memory
-/// requirements).
+/// included to only retain domain metadata for a specific set of domains (in order to bound memory
+/// requirements and enable early termination once all requested domains are found).
 #[derive(Debug, Default)]
 pub(crate) struct DomainMetadataVisitor {
     domain_metadatas: DomainMetadataMap,
-    domain_filter: Option<String>,
+    domain_filter: Option<HashSet<String>>,
 }
 
 impl DomainMetadataVisitor {
-    /// Create a new visitor. When domain_filter is set then we only retain
-    pub(crate) fn new(domain_filter: Option<String>) -> Self {
+    /// Create a new visitor. When domain_filter is set then we only retain domain metadata for
+    /// domains in the provided set, enabling early termination once all requested domains are
+    /// found.
+    pub(crate) fn new(domain_filter: Option<HashSet<String>>) -> Self {
         DomainMetadataVisitor {
             domain_filter,
             ..Default::default()
@@ -467,12 +468,18 @@ impl DomainMetadataVisitor {
         })
     }
 
+    /// Returns true if a domain filter is set and all requested domains have been found.
+    /// This is used to enable early termination of log replay once all N requested domains
+    /// have been discovered.
     pub(crate) fn filter_found(&self) -> bool {
-        self.domain_filter.is_some() && !self.domain_metadatas.is_empty()
+        self.domain_filter
+            .as_ref()
+            .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
     pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
-        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to filter
+        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to
+        // filter
         self.domain_metadatas.retain(|_, dm| !dm.removed);
         self.domain_metadatas
     }
@@ -490,14 +497,18 @@ impl RowVisitor for DomainMetadataVisitor {
         for i in 0..row_count {
             let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
             if let Some(domain) = domain {
-                // if caller requested a specific domain then only visit matches
+                // if caller requested specific domains then only visit matches
                 let filter = self.domain_filter.as_ref();
-                if filter.is_none_or(|requested| requested == &domain) {
-                    let domain_metadata =
-                        DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
-                    self.domain_metadatas
-                        .entry(domain)
-                        .or_insert(domain_metadata);
+                if filter.is_none_or(|requested| requested.contains(&domain)) {
+                    // Since batches are visited newest-first, a domain already present in
+                    // domain_metadatas was found in a newer commit and takes precedence.
+                    // Use Entry::Vacant so we only read configuration/removed when the
+                    // slot is actually empty, avoiding unnecessary field access.
+                    if let Entry::Vacant(entry) = self.domain_metadatas.entry(domain.clone()) {
+                        let domain_metadata =
+                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)?;
+                        entry.insert(domain_metadata);
+                    }
                 }
             }
         }
@@ -683,9 +694,10 @@ impl RowVisitor for InCommitTimestampVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::arrow::array::StringArray;
-
+    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
     use crate::table_features::TableFeature;
@@ -827,7 +839,7 @@ mod tests {
         };
         let expected = vec![add1, add2, add3];
         assert_eq!(add_visitor.adds.len(), expected.len());
-        for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected) {
             assert_eq!(add, expected);
         }
     }
@@ -1116,7 +1128,8 @@ mod tests {
         assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering
-        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["zach3".to_string()])));
         domain_metadata_visitor
             .visit_rows_of(commit_1.as_ref())
             .unwrap();
@@ -1137,7 +1150,8 @@ mod tests {
         assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering for a domain that is not present
-        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["notexist".to_string()])));
         domain_metadata_visitor
             .visit_rows_of(commit_1.as_ref())
             .unwrap();
@@ -1147,9 +1161,92 @@ mod tests {
         assert!(domain_metadata_visitor.domain_metadatas.is_empty());
     }
 
-    /*************************************
-     *  In-commit timestamp visitor tests *
-     **************************************/
+    #[test]
+    fn test_domain_metadata_visitor_multi_domain_filter() {
+        // Reuse the same two-commit setup from test_parse_domain_metadata.
+        // commit_1 (newer): zach1(removed), zach2, zach3(removed), zach4, zach5(removed), zach6
+        // commit_0 (older): zach1(removed), zach2, zach3, zach4(removed), zach7(removed), zach8
+        let commit_1: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"cfg3","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"cfg4","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach5","configuration":"cfg5","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach6","configuration":"cfg6","removed":false}}"#,
+            ]
+            .into(),
+        );
+        let commit_0: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"old_cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"old_cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"old_cfg3","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"old_cfg4","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach7","configuration":"cfg7","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach8","configuration":"cfg8","removed":false}}"#,
+            ]
+            .into(),
+        );
+
+        // --- filter for two active domains both in commit_1 ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach4".to_string(),
+        ])));
+        assert!(!visitor.filter_found()); // nothing found yet
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // both zach2 and zach4 appear in commit_1, so early termination should trigger
+        assert!(visitor.filter_found());
+        // commit_0 would NOT be visited in a real replay (early termination), but even if it
+        // were the results should be the same since commit_1 entries take precedence
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach4"].configuration, "cfg4");
+
+        // --- filter spanning both commits (zach2 in commit_1, zach8 in commit_0) ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach8".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // only zach2 found so far — should NOT terminate early yet
+        assert!(!visitor.filter_found());
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        // now zach8 found too
+        assert!(visitor.filter_found());
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach8"].configuration, "cfg8");
+
+        // --- filter where one domain is removed (tombstone) ---
+        // zach3 is removed in commit_1; only zach6 survives into_domain_metadatas
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach3".to_string(),
+            "zach6".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        assert!(visitor.filter_found()); // both found in commit_1
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 1); // zach3 is removed, filtered out
+        assert_eq!(result["zach6"].configuration, "cfg6");
+
+        // --- filter where no requested domains exist ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "ghost1".to_string(),
+            "ghost2".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        assert!(!visitor.filter_found());
+        assert!(visitor.into_domain_metadatas().is_empty());
+    }
+
+    // ------------------------------------------------------------
+    //  In-commit timestamp visitor tests
+    // ------------------------------------------------------------
 
     fn add_action() -> &'static str {
         r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#
@@ -1161,7 +1258,7 @@ mod tests {
     fn transform_batch(batch: Box<dyn EngineData>) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
         let expression =
-            Expression::Struct(vec![Arc::new(Expression::Struct(vec![column_expr_ref!(
+            Expression::struct_from([Arc::new(Expression::struct_from([column_expr_ref!(
                 "commitInfo.inCommitTimestamp"
             )]))]);
         engine
@@ -1202,5 +1299,30 @@ mod tests {
             vec![commit_info_action(), add_action()],
             Some(1677811178585), // Retrieved ICT
         );
+    }
+
+    // Helper to create a boolean batch for SelectionVectorVisitor tests
+    fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
+        let array = BooleanArray::from(values);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("output", DataType::Boolean, false)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_batch(vec![], 0, "empty batch should have no filtered rows")]
+    #[case::all_selected(vec![true, true, true, true], 0, "all selected should have no filtered rows")]
+    #[case::all_filtered(vec![false, false, false, false, false], 5, "all filtered should count all rows")]
+    #[case::mixed_selection(vec![true, false, true, false, false, true], 3, "mixed selection should count false values")]
+    fn selection_vector_visitor_counter_accuracy(
+        #[case] input: Vec<bool>,
+        #[case] expected_filtered: u64,
+        #[case] _description: &str,
+    ) {
+        let batch = create_boolean_batch(input.clone());
+        let mut visitor = SelectionVectorVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.selection_vector, input);
+        assert_eq!(visitor.num_filtered, expected_filtered);
     }
 }

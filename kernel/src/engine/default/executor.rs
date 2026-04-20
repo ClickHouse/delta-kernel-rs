@@ -10,7 +10,8 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use futures::{future::BoxFuture, Future};
+use futures::future::BoxFuture;
+use futures::Future;
 
 use crate::DeltaResult;
 
@@ -21,6 +22,11 @@ use crate::DeltaResult;
 /// on another thread. This could be a multi-threaded runtime, like Tokio's or
 /// could be a single-threaded runtime on a background thread.
 pub trait TaskExecutor: Send + Sync + 'static {
+    /// The type of guard returned for `enter`
+    type Guard<'a>
+    where
+        Self: 'a;
+
     /// Block on the given future, returning its output.
     ///
     /// This should NOT panic if called within an async context. Thus it can't
@@ -39,24 +45,49 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
+
+    /// Enter the runtime context of this executor.
+    fn enter(&self) -> Self::Guard<'_>;
 }
 
 #[cfg(any(feature = "tokio", test))]
 pub mod tokio {
-    use super::TaskExecutor;
-    use futures::TryFutureExt;
-    use futures::{future::BoxFuture, Future};
+    use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
-    use tokio::runtime::RuntimeFlavor;
 
+    use futures::future::BoxFuture;
+    use futures::{Future, TryFutureExt};
+    use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
+
+    use super::TaskExecutor;
     use crate::{DeltaResult, Error};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
+    ///
+    /// On drop, the background thread is joined to ensure the runtime is fully
+    /// shut down before the executor is destroyed.
     #[derive(Debug)]
     pub struct TokioBackgroundExecutor {
-        sender: tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>,
-        _thread: std::thread::JoinHandle<()>,
+        sender: ManuallyDrop<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
+        handle: Handle,
+        /// `Option` because `join` takes ownership; we `take` it in `Drop` to move the
+        /// handle out. Never `None` outside of `Drop`.
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TokioBackgroundExecutor {
+        fn drop(&mut self) {
+            // SAFETY: The inner `Sender` has not been dropped yet because this is
+            // the only drop site and `Drop::drop` runs exactly once.
+            // Drop sender first to close the channel, signaling the background
+            // thread to exit its recv loop.
+            unsafe { ManuallyDrop::drop(&mut self.sender) };
+            // Join the thread so that runtime shutdown completes before we return.
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     impl Default for TokioBackgroundExecutor {
@@ -67,21 +98,26 @@ pub mod tokio {
 
     impl TokioBackgroundExecutor {
         pub fn new() -> Self {
+            let (handle_sender, handle_receiver) = std::sync::mpsc::channel::<Handle>();
             let (sender, mut receiver) = tokio::sync::mpsc::channel::<BoxFuture<'_, ()>>(50);
             let thread = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
+                let handle = rt.handle().clone();
+                handle_sender.send(handle).unwrap();
                 rt.block_on(async move {
                     while let Some(task) = receiver.recv().await {
                         tokio::task::spawn(task);
                     }
                 });
             });
+            let handle = handle_receiver.recv().unwrap();
             Self {
-                sender,
-                _thread: thread,
+                sender: ManuallyDrop::new(sender),
+                handle,
+                thread: Some(thread),
             }
         }
     }
@@ -107,6 +143,8 @@ pub mod tokio {
     }
 
     impl TaskExecutor for TokioBackgroundExecutor {
+        type Guard<'a> = EnterGuard<'a>;
+
         fn block_on<T>(&self, task: T) -> T::Output
         where
             T: Future + Send + 'static,
@@ -147,6 +185,10 @@ pub mod tokio {
         {
             Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
         }
+
+        fn enter(&self) -> EnterGuard<'_> {
+            self.handle.enter()
+        }
     }
 
     /// A [`TaskExecutor`] that uses the tokio multi-threaded runtime.
@@ -179,10 +221,10 @@ pub mod tokio {
         /// Create a new executor that owns its own multi-threaded Tokio runtime.
         ///
         /// # Parameters
-        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default.
-        ///   See [`tokio::runtime::Builder::worker_threads`].
-        /// - `max_blocking_threads`: Maximum number of threads for blocking operations.
-        ///   If `None`, uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
+        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default. See
+        ///   [`tokio::runtime::Builder::worker_threads`].
+        /// - `max_blocking_threads`: Maximum number of threads for blocking operations. If `None`,
+        ///   uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
         ///
         /// # Errors
         /// Returns an error if the runtime cannot be created.
@@ -213,8 +255,10 @@ pub mod tokio {
     }
 
     impl TaskExecutor for TokioMultiThreadExecutor {
-        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
-        // See:
+        type Guard<'a> = EnterGuard<'a>;
+
+        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's
+        // `max_blocking_threads`, this can deadlock See:
         // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
         fn block_on<T>(&self, task: T) -> T::Output
         where
@@ -270,6 +314,10 @@ pub mod tokio {
             R: Send + 'static,
         {
             Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+        }
+
+        fn enter(&self) -> EnterGuard<'_> {
+            self.handle.enter()
         }
     }
 
@@ -395,7 +443,8 @@ pub mod tokio {
                 tx.send(result).ok();
             });
 
-            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should deadlock
+            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should
+            // deadlock
             let timeout = Duration::from_millis(500);
             let result = rx.recv_timeout(timeout);
 
@@ -424,6 +473,33 @@ pub mod tokio {
                 42
             });
             assert_eq!(result, 42);
+        }
+
+        #[rstest::rstest]
+        #[case::multithreaded(
+            TokioMultiThreadExecutor::new_owned_runtime(None, None).expect("Couldn't create multithreaded executor")
+        )]
+        #[case::background(TokioBackgroundExecutor::new())]
+        fn can_enter_a_runtime<T: TaskExecutor>(#[case] executor: T) {
+            // Verify we're not inside a Tokio runtime
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Test must run outside of a Tokio runtime"
+            );
+
+            let guard = executor.enter();
+
+            assert!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "Should have entered runtime"
+            );
+
+            drop(guard);
+
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Should have exited runtime"
+            );
         }
     }
 }

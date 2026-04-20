@@ -1,9 +1,10 @@
+use std::fs::File;
+
 use super::*;
 use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::Predicate;
-use std::fs::File;
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
 ///
@@ -66,9 +67,11 @@ fn test_get_stat_values() {
         filter.get_nullcount_stat(&column_name!("bool")),
         Some(3i64.into())
     );
+
+    // Should be Some(0), but https://github.com/apache/arrow-rs/issues/9451
     assert_eq!(
         filter.get_nullcount_stat(&column_name!("varlen.utf8")),
-        Some(0i64.into())
+        None // Some(0i64.into())
     );
 
     assert_eq!(

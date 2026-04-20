@@ -25,7 +25,7 @@ StructExpression
   Date(32)
   Binary(0000deadbeefcafe)
   Decimal(1,1,20,3)
-  Null
+  Null(Short)
   Struct
     Field: top
       Struct
@@ -66,6 +66,8 @@ StructExpression
     Integer(42)
     Double(1.111000)
   Unknown(mystery)
+  MapToStruct
+    Column(pv)
   Divide
     Integer(0)
     Integer(0)
@@ -151,6 +153,8 @@ StructExpression
   Date(19000)
   Timestamp(1234567890)
   TimestampNtz(9876543210)
+  Null(Integer)
+  Null(Decimal(10,5))
   Add
     Integer(10)
     Integer(20)
@@ -167,6 +171,8 @@ StructExpression
     Integer(1)
     Long(2)
     Double(3.000000)
+  MapToStruct
+    Column(partitionValues)
 
 === Expression Round-trip Test ===
 SUCCESS: Round-trip expression matches original!

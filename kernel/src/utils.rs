@@ -4,10 +4,10 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -99,7 +99,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -109,49 +109,68 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
-// Extension trait for Cow<'_, T>
-pub(crate) trait CowExt<T: ToOwned + ?Sized> {
-    /// The owned type that corresopnds to Self
-    type Owned;
-
-    /// Propagate the results of nested transforms. If the nested transform made no change (borrowed
-    /// `self`), then return a borrowed result `s` as well. Otherwise, invoke the provided mapping
-    /// function `f` to convert the owned nested result into an owned result.
-    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S>;
-}
-
-// Basic implementation for a single Cow value
-impl<T: ToOwned + ?Sized> CowExt<T> for Cow<'_, T> {
-    type Owned = T::Owned;
-
-    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(T::Owned) -> S) -> Cow<'_, S> {
-        match self {
-            Cow::Owned(v) => Cow::Owned(f(v)),
-            Cow::Borrowed(_) => Cow::Borrowed(s),
+/// Extension trait for adding completion callbacks to iterators.
+pub(crate) trait IteratorExt: Iterator + Sized {
+    /// Wraps this iterator to call a closure when fully exhausted.
+    ///
+    /// The closure is called only when `next()` returns `None`. If the iterator
+    /// is dropped before exhaustion, a warning is logged but the closure is not called.
+    fn on_complete<F: FnOnce()>(self, f: F) -> OnComplete<Self, F> {
+        OnComplete {
+            inner: self,
+            on_complete: Some(f),
         }
     }
 }
 
-// Additional implementation for a pair of Cow values
-impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, Cow<'a, T>) {
-    type Owned = (T::Owned, T::Owned);
+impl<I: Iterator> IteratorExt for I {}
 
-    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S> {
-        match self {
-            (Cow::Borrowed(_), Cow::Borrowed(_)) => Cow::Borrowed(s),
-            (left, right) => Cow::Owned(f((left.into_owned(), right.into_owned()))),
+/// Iterator adaptor that executes a closure when fully exhausted.
+pub(crate) struct OnComplete<I, F: FnOnce()> {
+    inner: I,
+    on_complete: Option<F>,
+}
+
+impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
+    fn drop(&mut self) {
+        if self.on_complete.is_some() {
+            tracing::debug!(
+                "OnComplete iterator dropped before exhaustion; completion callback not called"
+            );
+        }
+    }
+}
+
+impl<I, F> Iterator for OnComplete<I, F>
+where
+    I: Iterator,
+    F: FnOnce(),
+{
+    type Item = I::Item;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(item) => Some(item),
+            None => {
+                if let Some(f) = self.on_complete.take() {
+                    f();
+                }
+                None
+            }
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use std::path::PathBuf;
-    use std::{path::Path, sync::Arc};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
@@ -162,11 +181,42 @@ pub(crate) mod test_utils {
     };
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
-    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
-    use crate::{Engine, Snapshot};
+    use crate::metrics::{MetricEvent, MetricsReporter};
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::ObjectStoreExt as _;
+    use crate::table_features::ColumnMappingMode;
+    use crate::transaction::create_table::create_table;
+    use crate::transaction::{CreateTable, Transaction};
+    use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
+
+    /// A metrics reporter that captures all events for test assertions.
+    #[derive(Debug, Default)]
+    pub(crate) struct CapturingReporter {
+        events: Mutex<Vec<MetricEvent>>,
+    }
+
+    impl MetricsReporter for CapturingReporter {
+        fn report(&self, event: MetricEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl CapturingReporter {
+        /// Returns a copy of all captured events.
+        pub(crate) fn events(&self) -> Vec<MetricEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Clears all captured events.
+        pub(crate) fn clear(&self) {
+            self.events.lock().unwrap().clear();
+        }
+    }
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -186,7 +236,8 @@ pub(crate) mod test_utils {
     }
 
     use crate::schema::{
-        DataType as KernelDataType, PrimitiveType, SchemaRef, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType,
     };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
@@ -229,15 +280,16 @@ pub(crate) mod test_utils {
         }
     }
 
-    /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
-    /// the default module
+    /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData`
+    /// from the default module
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         ArrowEngineData::try_from_engine_data(engine_data)
             .unwrap()
             .into()
     }
 
-    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
+    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and
+    /// comparing
     pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
     }
@@ -276,6 +328,7 @@ pub(crate) mod test_utils {
     }
 
     // TODO: allow tests to pass in context (issue#1133)
+    #[track_caller]
     pub(crate) fn assert_result_error_with_message<T, E: ToString>(
         res: Result<T, E>,
         message: &str,
@@ -292,12 +345,61 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Asserts the 2x2 matrix of (schema_has_feature, protocol_supports_feature) outcomes
+    /// for schema-level feature validators. The expected pattern is:
+    /// - schema + protocol => Ok
+    /// - no schema + no protocol => Ok
+    /// - no schema + protocol => Ok
+    /// - schema + no protocol => Err (orphaned schema presence)
+    ///
+    /// Additional error schemas (e.g. nested) are also tested against `protocol_without`.
+    #[track_caller]
+    pub(crate) fn assert_schema_feature_validation(
+        schema_with: &StructType,
+        schema_without: &StructType,
+        protocol_with: &Protocol,
+        protocol_without: &Protocol,
+        extra_err_schemas: &[&StructType],
+        err_msg: &str,
+    ) {
+        make_test_tc(schema_with.clone(), protocol_with.clone(), [])
+            .expect("feature present + supported");
+        make_test_tc(schema_without.clone(), protocol_without.clone(), [])
+            .expect("feature absent + unsupported");
+        make_test_tc(schema_without.clone(), protocol_with.clone(), [])
+            .expect("feature absent + supported");
+        assert_result_error_with_message(
+            make_test_tc(schema_with.clone(), protocol_without.clone(), []),
+            err_msg,
+        );
+        for schema in extra_err_schemas {
+            assert_result_error_with_message(
+                make_test_tc((*schema).clone(), protocol_without.clone(), []),
+                err_msg,
+            );
+        }
+    }
+
+    /// Creates a [`TableConfiguration`] from a schema, protocol, and table properties.
+    /// Useful for testing validators that need a TC.
+    pub(crate) fn make_test_tc(
+        schema: StructType,
+        protocol: Protocol,
+        props: impl IntoIterator<Item = (String, String)>,
+    ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
+        let schema = std::sync::Arc::new(schema);
+        let metadata =
+            Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    }
+
     /// Helper to get a field from a StructType by name, panicking if not found.
     pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
         struct_type
             .fields()
             .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{}' not found", name))
+            .unwrap_or_else(|| panic!("Field '{name}' not found"))
             .clone()
     }
 
@@ -310,8 +412,7 @@ pub(crate) mod test_utils {
             let field = get_schema_field(schema, field_name);
             assert!(
                 matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{}' should be a struct type",
-                field_name
+                "Field '{field_name}' should be a struct type"
             );
         }
 
@@ -369,6 +470,343 @@ pub(crate) mod test_utils {
         );
     }
 
+    // ==================== Test schema helpers ====================
+    //
+    // Reusable test schemas
+    // Each variant exists with and without column mapping metadata.
+
+    /// Helper to add column mapping metadata to a [`StructField`].
+    fn with_column_mapping(field: StructField, id: i64, physical_name: &str) -> StructField {
+        field.with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical_name.into()),
+            ),
+        ])
+    }
+
+    /// Flat schema: `[id: long, name: string]`
+    pub(crate) fn test_schema_flat() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, true),
+            StructField::nullable("name", KernelDataType::STRING),
+        ]))
+    }
+
+    /// Flat schema with column mapping metadata.
+    pub(crate) fn test_schema_flat_with_column_mapping() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, true),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable("name", KernelDataType::STRING),
+                2,
+                "phys_name",
+            ),
+        ]))
+    }
+
+    /// Nested struct schema with array and map inside the struct
+    pub(crate) fn test_schema_nested() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, true),
+            StructField::nullable(
+                "info",
+                StructType::new_unchecked([
+                    StructField::nullable("name", KernelDataType::STRING),
+                    StructField::nullable("age", KernelDataType::INTEGER),
+                    StructField::nullable(
+                        "tags",
+                        MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+                    ),
+                    StructField::nullable("scores", ArrayType::new(KernelDataType::INTEGER, true)),
+                ]),
+            ),
+        ]))
+    }
+
+    /// Nested struct schema with column mapping metadata.
+    pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, true),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable(
+                    "info",
+                    StructType::new_unchecked([
+                        with_column_mapping(
+                            StructField::nullable("name", KernelDataType::STRING),
+                            3,
+                            "phys_name",
+                        ),
+                        with_column_mapping(
+                            StructField::nullable("age", KernelDataType::INTEGER),
+                            4,
+                            "phys_age",
+                        ),
+                        with_column_mapping(
+                            StructField::nullable(
+                                "tags",
+                                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+                            ),
+                            5,
+                            "phys_tags",
+                        ),
+                        with_column_mapping(
+                            StructField::nullable(
+                                "scores",
+                                ArrayType::new(KernelDataType::INTEGER, true),
+                            ),
+                            6,
+                            "phys_scores",
+                        ),
+                    ]),
+                ),
+                2,
+                "phys_info",
+            ),
+        ]))
+    }
+
+    /// Schema with a map
+    pub(crate) fn test_schema_with_map() -> SchemaRef {
+        let value_struct = StructType::new_unchecked([
+            StructField::nullable("key", KernelDataType::STRING),
+            StructField::nullable("value", KernelDataType::INTEGER),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, true),
+            StructField::nullable(
+                "entries",
+                MapType::new(
+                    KernelDataType::STRING,
+                    KernelDataType::Struct(Box::new(value_struct)),
+                    true,
+                ),
+            ),
+            StructField::nullable("name", KernelDataType::STRING),
+        ]))
+    }
+
+    /// Schema with a map and column mapping metadata.
+    pub(crate) fn test_schema_with_map_and_column_mapping() -> SchemaRef {
+        let value_struct = StructType::new_unchecked([
+            with_column_mapping(
+                StructField::nullable("key", KernelDataType::STRING),
+                4,
+                "phys_key",
+            ),
+            with_column_mapping(
+                StructField::nullable("value", KernelDataType::INTEGER),
+                5,
+                "phys_value",
+            ),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, true),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable(
+                    "entries",
+                    MapType::new(
+                        KernelDataType::STRING,
+                        KernelDataType::Struct(Box::new(value_struct)),
+                        true,
+                    ),
+                ),
+                2,
+                "phys_entries",
+            ),
+            with_column_mapping(
+                StructField::nullable("name", KernelDataType::STRING),
+                3,
+                "phys_name",
+            ),
+        ]))
+    }
+
+    /// Schema with an array
+    pub(crate) fn test_schema_with_array() -> SchemaRef {
+        let item_struct = StructType::new_unchecked([
+            StructField::nullable("label", KernelDataType::STRING),
+            StructField::nullable("count", KernelDataType::INTEGER),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, true),
+            StructField::nullable(
+                "items",
+                ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+            ),
+            StructField::nullable("name", KernelDataType::STRING),
+        ]))
+    }
+
+    /// Schema with an array and column mapping metadata.
+    pub(crate) fn test_schema_with_array_and_column_mapping() -> SchemaRef {
+        let item_struct = StructType::new_unchecked([
+            with_column_mapping(
+                StructField::nullable("label", KernelDataType::STRING),
+                4,
+                "phys_label",
+            ),
+            with_column_mapping(
+                StructField::nullable("count", KernelDataType::INTEGER),
+                5,
+                "phys_count",
+            ),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, true),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable(
+                    "items",
+                    ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+                ),
+                2,
+                "phys_items",
+            ),
+            with_column_mapping(
+                StructField::nullable("name", KernelDataType::STRING),
+                3,
+                "phys_name",
+            ),
+        ]))
+    }
+
+    /// Deeply nested schema: struct -> array -> struct -> map(value) -> struct.
+    ///
+    /// The leaf struct field is intentionally **not** annotated with column mapping metadata,
+    /// so this schema can be used to test error paths when column mapping is enabled.
+    pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
+        let leaf_struct =
+            StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
+        let map_type = MapType::new(
+            KernelDataType::STRING,
+            KernelDataType::Struct(Box::new(leaf_struct)),
+            true,
+        );
+        let mid_struct = StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("mid_field", map_type),
+            2,
+            "phys_mid_field",
+        )]);
+        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
+        StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("top", array_type),
+            1,
+            "phys_top",
+        )])
+    }
+
+    /// Build a create-table transaction with the given schema and column mapping mode.
+    /// Returns the engine and uncommitted transaction.
+    pub(crate) fn setup_column_mapping_txn(
+        schema: SchemaRef,
+        mode: ColumnMappingMode,
+    ) -> DeltaResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+        let mode_str = match mode {
+            ColumnMappingMode::Name => "name",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::None => "none",
+        };
+        let store = Arc::new(InMemory::new());
+        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+
+        let txn = create_table("memory:///test_table", schema, "DefaultEngine")
+            .with_table_properties([("delta.columnMapping.mode", mode_str)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        Ok((engine, txn))
+    }
+
+    /// Validate that a physical schema matches the logical schema's column mapping metadata.
+    /// For Name/Id modes, checks physicalName, columnMapping.id, and parquet.field.id on
+    /// each field. For None mode, only checks field names match.
+    pub(crate) fn validate_physical_schema_column_mapping(
+        logical_schema: &StructType,
+        physical_schema: &StructType,
+        mode: ColumnMappingMode,
+    ) {
+        assert_eq!(
+            physical_schema.fields().count(),
+            logical_schema.fields().count()
+        );
+
+        // Collect expected (physical_name, field_id) from logical schema
+        let expected: Vec<_> = logical_schema
+            .fields()
+            .map(|f| {
+                let physical_name =
+                    match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                        Some(MetadataValue::String(name)) => name.clone(),
+                        _ if mode == ColumnMappingMode::None => f.name().to_string(),
+                        _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
+                    };
+                let field_id = match f.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                    Some(MetadataValue::Number(id)) => *id,
+                    _ if mode == ColumnMappingMode::None => -1,
+                    _ => panic!(
+                        "Logical field '{}' missing columnMapping.id metadata",
+                        f.name()
+                    ),
+                };
+                (physical_name, field_id)
+            })
+            .collect();
+
+        // Validate each physical field against expected values
+        for (physical_field, (expected_name, expected_id)) in
+            physical_schema.fields().zip(expected.iter())
+        {
+            assert_eq!(
+                physical_field.name(),
+                expected_name,
+                "Physical field name mismatch"
+            );
+
+            if mode == ColumnMappingMode::None {
+                continue;
+            }
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+                Some(&MetadataValue::String(expected_name.clone())),
+                "columnMapping.physicalName mismatch for '{}'",
+                physical_field.name()
+            );
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "columnMapping.id mismatch for '{}'",
+                physical_field.name()
+            );
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "parquet.field.id mismatch for '{}'",
+                physical_field.name()
+            );
+        }
+    }
+
     /// Load a test table from tests/data directory.
     /// Tries compressed (tar.zst) first, falls back to extracted.
     /// Returns (engine, snapshot, optional tempdir). The TempDir must be kept alive
@@ -389,7 +827,7 @@ pub(crate) mod test_utils {
                 path.push("tests/data");
                 path.push(table_name);
                 let path = std::fs::canonicalize(path)
-                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {e}")))?;
                 (path, None)
             }
         };
@@ -459,5 +897,55 @@ mod tests {
             url.to_string(),
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
+    }
+
+    mod on_complete_tests {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        use super::*;
+
+        #[test]
+        fn test_calls_on_exhaustion() {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = called.clone();
+            let mut iter = vec![1, 2].into_iter().on_complete(move || {
+                called_clone.store(true, Ordering::SeqCst);
+            });
+            assert_eq!(iter.next(), Some(1));
+            assert!(!called.load(Ordering::SeqCst));
+            assert_eq!(iter.next(), Some(2));
+            assert_eq!(iter.next(), None);
+            assert!(called.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn test_does_not_call_on_early_drop() {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = called.clone();
+            {
+                let mut iter = vec![1, 2].into_iter().on_complete(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                });
+                assert_eq!(iter.next(), Some(1));
+                // Drop without exhausting - callback should NOT be called
+            }
+            assert!(!called.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn test_calls_only_once() {
+            let count = Arc::new(AtomicU32::new(0));
+            let count_clone = count.clone();
+            {
+                let mut iter = vec![1].into_iter().on_complete(move || {
+                    count_clone.fetch_add(1, Ordering::SeqCst);
+                });
+                assert_eq!(iter.next(), Some(1));
+                assert_eq!(iter.next(), None); // triggers callback
+                assert_eq!(iter.next(), None); // should not trigger again
+            } // drop should not trigger again
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 }

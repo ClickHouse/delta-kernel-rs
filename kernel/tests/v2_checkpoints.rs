@@ -1,13 +1,16 @@
-use delta_kernel::arrow::array::RecordBatch;
+use std::sync::Arc;
 
+use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
 
-use test_utils::load_test_data;
-
 use itertools::Itertools;
-use test_utils::read_scan;
+use test_utils::{insert_data, load_test_data, read_scan, test_table_setup_mt};
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
@@ -147,10 +150,11 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// The test cases below are derived from delta-spark's `CheckpointSuite`.
 ///
 /// These tests are converted from delta-spark using the following process:
-/// 1. Specific test cases of interest in `delta-spark` were modified to persist their generated tables
+/// 1. Specific test cases of interest in `delta-spark` were modified to persist their generated
+///    tables
 /// 2. These tables were compressed into `.tar.zst` archives and copied to delta-kernel-rs
-/// 3. Each test loads a stored table, scans it, and asserts that the returned table state
-///    matches the expected state derived from the corresponding table insertions in `delta-spark`
+/// 3. Each test loads a stored table, scans it, and asserts that the returned table state matches
+///    the expected state derived from the corresponding table insertions in `delta-spark`
 ///
 /// The following is the ported list of `delta-spark` tests -> `delta-kernel-rs` tests:
 ///
@@ -158,10 +162,14 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `multipart v2 checkpoint` -> `v2_checkpoints_parquet_with_sidecars`
 /// - `All actions in V2 manifest` -> `v2_checkpoints_json_without_sidecars`
 /// - `All actions in V2 manifest` -> `v2_checkpoints_parquet_without_sidecars`
-/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` -> `v2_classic_checkpoint_json`
-/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` -> `v2_classic_checkpoint_parquet`
-/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_json_with_last_checkpoint`
-/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_parquet_with_last_checkpoint`
+/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` ->
+///   `v2_classic_checkpoint_json`
+/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` ->
+///   `v2_classic_checkpoint_parquet`
+/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
+///   `v2_checkpoints_json_with_last_checkpoint`
+/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
+///   `v2_checkpoints_parquet_with_last_checkpoint`
 #[test]
 fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
@@ -221,4 +229,80 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
         "v2-checkpoints-parquet-with-last-checkpoint",
         get_simple_id_table(),
     )
+}
+
+/// Tests that writing a V2 checkpoint to parquet succeeds.
+///
+/// V2 checkpoints include a checkpointMetadata batch in addition to the regular action
+/// batches. All batches in a parquet file must share the same schema. This test verifies
+/// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Commit an add action via the transaction API so the checkpoint has action batches
+    let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let result = insert_data(
+        snapshot0,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )
+    .await?;
+
+    let CommitResult::CommittedTransaction(committed) = result else {
+        panic!("Expected CommittedTransaction");
+    };
+
+    let snapshot = committed
+        .post_commit_snapshot()
+        .expect("expected post-commit snapshot");
+
+    // This writes to parquet — will fail if the checkpointMetadata batch has a different
+    // schema than the action batches.
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Verify the checkpoint was written and is used by a fresh snapshot
+    let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot2.version(), 1);
+    let log_segment = snapshot2.log_segment();
+    assert!(
+        !log_segment.listed.checkpoint_parts.is_empty(),
+        "expected snapshot to use the written checkpoint, but checkpoint_parts is empty"
+    );
+    assert_eq!(
+        log_segment.checkpoint_version,
+        Some(1),
+        "expected checkpoint at version 1"
+    );
+    assert!(
+        log_segment.listed.ascending_commit_files.is_empty(),
+        "expected no commit files after checkpoint, but found: {:?}",
+        log_segment.listed.ascending_commit_files
+    );
+
+    // Verify reading data from the checkpointed snapshot returns the expected rows
+    let scan = snapshot2.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    assert_batches_sorted_eq!(
+        vec![
+            "+-------+",
+            "| value |",
+            "+-------+",
+            "| 1     |",
+            "+-------+",
+        ],
+        &batches
+    );
+
+    Ok(())
 }
