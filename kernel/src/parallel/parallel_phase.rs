@@ -899,6 +899,7 @@ mod tests {
                     "Single-node: scan_file.stats should be None when skip_stats=true"
                 );
                 ps.push(scan_file.path);
+                true
             })
         })?;
         expected_paths.sort();
@@ -915,6 +916,7 @@ mod tests {
                     "sequential: scan_file.stats should be None when skip_stats=true"
                 );
                 ps.push(scan_file.path);
+                true
             })
         })?;
 
@@ -932,6 +934,7 @@ mod tests {
                             "parallel: scan_file.stats should be None when skip_stats=true"
                         );
                         ps.push(scan_file.path);
+                        true
                     })
                 })?;
 

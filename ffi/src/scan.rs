@@ -454,21 +454,10 @@ pub struct Stats {
     pub num_records: u64,
 }
 
-/// Contains information that can be used to get a selection vector. If `has_vector` is false, that
-/// indicates there is no selection vector to consider. It is always possible to get a vector out of
-/// a `DvInfo`, but if `has_vector` is false it will just be an empty vector (indicating all
-/// selected). Without this there's no way for a connector using ffi to know if a &DvInfo actually
-/// has a vector in it. We have has_vector() on the rust side, but this isn't exposed via ffi. So
-/// this just wraps the &DvInfo in another struct which includes a boolean that says if there is a
-/// dv to consider or not.  This allows engines to ignore dv info if there isn't any without needing
-/// to make another ffi call at all.
-#[repr(C)]
-pub struct CDvInfo {
-    info: DvInfo,
-    has_vector: bool,
-}
-
-#[handle_descriptor(target=CDvInfo, mutable=false, sized=true)]
+/// Opaque handle to a [`DvInfo`] that allows checking for and reading a deletion vector for a
+/// scan file. Pass to [`dv_info_has_vector`] to check presence, and to [`selection_vector_from_dv`]
+/// or [`row_indexes_from_dv`] to read the vector. Must be freed with [`free_kernel_dv_info`].
+#[handle_descriptor(target=DvInfo, mutable=false, sized=true)]
 pub struct SharedDvInfo;
 
 /// Check if a deletion vector is present in the [`SharedDvInfo`].
@@ -478,7 +467,7 @@ pub struct SharedDvInfo;
 #[no_mangle]
 pub unsafe extern "C" fn dv_info_has_vector(dv_info: Handle<SharedDvInfo>) -> bool {
     let dv_info = unsafe { dv_info.as_ref() };
-    dv_info.has_vector
+    dv_info.has_vector()
 }
 
 /// This callback will be invoked for each valid file that needs to be read for a scan.
@@ -622,7 +611,7 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     let dv_info_ref = unsafe { dv_info.as_ref() };
     let engine = unsafe { engine.as_ref() };
     let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    selection_vector_from_dv_impl(&dv_info_ref.info, engine, root_url).into_extern_result(&engine)
+    selection_vector_from_dv_impl(dv_info_ref, engine, root_url).into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
@@ -649,7 +638,7 @@ pub unsafe extern "C" fn row_indexes_from_dv(
     let dv_info_ref = unsafe { dv_info.as_ref() };
     let engine = unsafe { engine.as_ref() };
     let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    row_indexes_from_dv_impl(&dv_info_ref.info, engine, root_url).into_extern_result(&engine)
+    row_indexes_from_dv_impl(dv_info_ref, engine, root_url).into_extern_result(&engine)
 }
 
 fn row_indexes_from_dv_impl(
@@ -682,12 +671,7 @@ fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) -> bool {
     let stats = scan_file.stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
-    let has_vector = scan_file.dv_info.has_vector();
-    let dv_info = CDvInfo {
-        info: scan_file.dv_info,
-        has_vector,
-    };
-    let dv_info_handle: Handle<SharedDvInfo> = Arc::new(dv_info).into();
+    let dv_info_handle: Handle<SharedDvInfo> = Arc::new(scan_file.dv_info).into();
     let path = scan_file.path.as_str();
     (context.callback)(
         context.engine_context,
@@ -1116,6 +1100,114 @@ mod scan_builder_tests {
         unsafe { free_scan_builder(builder) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
+    }
+
+    // Thread-local accumulators for visit_scan_metadata tests (avoids extern "C" fn closure limits)
+    use std::cell::RefCell;
+    thread_local! {
+        static VISIT_COUNT: RefCell<usize> = const { RefCell::new(0) };
+        static DV_HAS_VECTOR_RESULTS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        static STOP_AFTER: RefCell<usize> = const { RefCell::new(usize::MAX) };
+    }
+
+    extern "C" fn test_scan_callback(
+        _ctx: crate::NullableCvoid,
+        _path: crate::KernelStringSlice,
+        _size: i64,
+        _mod_time: i64,
+        _stats: Option<&super::Stats>,
+        dv_info: super::Handle<super::SharedDvInfo>,
+        transform: crate::OptionalValue<super::Handle<crate::expressions::SharedExpression>>,
+        _partition_map: &super::CStringMap,
+    ) -> bool {
+        VISIT_COUNT.with(|c| *c.borrow_mut() += 1);
+        let hv = unsafe { super::dv_info_has_vector(dv_info.shallow_copy()) };
+        DV_HAS_VECTOR_RESULTS.with(|r| r.borrow_mut().push(hv));
+        unsafe { super::free_kernel_dv_info(dv_info) };
+        if let crate::OptionalValue::Some(expr) = transform {
+            unsafe { expr.drop_handle() };
+        }
+        let stop_after = STOP_AFTER.with(|s| *s.borrow());
+        let count = VISIT_COUNT.with(|c| *c.borrow());
+        count < stop_after
+    }
+
+    /// Test that `dv_info_has_vector` returns `false` for a file without a deletion vector.
+    #[tokio::test]
+    async fn test_dv_info_has_vector_no_dv() {
+        VISIT_COUNT.with(|c| *c.borrow_mut() = 0);
+        DV_HAS_VECTOR_RESULTS.with(|r| r.borrow_mut().clear());
+        STOP_AFTER.with(|s| *s.borrow_mut() = usize::MAX);
+
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add("file.parquet".into()),
+        ]))
+        .await
+        .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let iter = unsafe {
+            ok_or_panic(super::scan_metadata_iter_init(
+                engine.shallow_copy(),
+                scan.shallow_copy(),
+            ))
+        };
+        let iter_ref = unsafe { iter.as_ref() };
+        {
+            let mut data = iter_ref.data.lock().unwrap();
+            if let Some(scan_metadata) = data.next().transpose().unwrap() {
+                super::visit_scan_metadata_impl(&scan_metadata, None, test_scan_callback).unwrap();
+            }
+        }
+        let results = DV_HAS_VECTOR_RESULTS.with(|r| r.borrow().clone());
+        assert_eq!(results.len(), 1, "expected callback to be called once");
+        assert!(!results[0], "file without DV must report has_vector=false");
+        unsafe {
+            super::free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    /// Test that returning `false` from the scan callback stops iteration for the current batch.
+    #[tokio::test]
+    async fn test_early_exit_stops_iteration() {
+        VISIT_COUNT.with(|c| *c.borrow_mut() = 0);
+        DV_HAS_VECTOR_RESULTS.with(|r| r.borrow_mut().clear());
+        STOP_AFTER.with(|s| *s.borrow_mut() = 1); // stop after the first file
+
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add("a.parquet".into()),
+            TestAction::Add("b.parquet".into()),
+        ]))
+        .await
+        .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let iter = unsafe {
+            ok_or_panic(super::scan_metadata_iter_init(
+                engine.shallow_copy(),
+                scan.shallow_copy(),
+            ))
+        };
+        let iter_ref = unsafe { iter.as_ref() };
+        {
+            let mut data = iter_ref.data.lock().unwrap();
+            if let Some(scan_metadata) = data.next().transpose().unwrap() {
+                super::visit_scan_metadata_impl(&scan_metadata, None, test_scan_callback).unwrap();
+            }
+        }
+        let count = VISIT_COUNT.with(|c| *c.borrow());
+        assert_eq!(count, 1, "callback returning false must stop after the first file");
+        unsafe {
+            super::free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
     }
 }
 

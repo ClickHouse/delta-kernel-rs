@@ -59,6 +59,8 @@ pub(crate) struct CdfScanFile {
     pub size: Option<i64>,
 }
 
+/// Callback for visiting CDF scan files. Returns `true` to continue iteration, or `false` to stop
+/// early for the current batch. See also [`crate::scan::state::ScanCallback`].
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile) -> bool;
 
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
