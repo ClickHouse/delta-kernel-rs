@@ -1,15 +1,12 @@
 //! FFI functions to allow engines to receive log and tracing events from kernel
 
-use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{fmt, io};
 
 use delta_kernel::{DeltaResult, Error};
-use tracing::{error, warn};
-use tracing::{
-    field::{Field as TracingField, Visit},
-    Event as TracingEvent, Subscriber,
-};
+use tracing::field::{Field as TracingField, Visit};
+use tracing::{error, warn, Event as TracingEvent, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
@@ -384,7 +381,8 @@ fn create_event_dispatch(
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
     Arc<Mutex<TracingEventFn>>,
 ) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
 
     let callback_arc = Arc::new(Mutex::new(callback));
     let (filter_layer, reload_handle) =
@@ -489,7 +487,8 @@ fn create_log_line_dispatch(
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
     Arc<Mutex<TracingLogLineFn>>,
 ) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
 
     let buffer = Arc::new(Mutex::new(vec![]));
     let writer = BufferedMessageWriter {
@@ -565,9 +564,7 @@ fn setup_log_line_subscriber(
 mod tests {
     use std::sync::LazyLock;
 
-    use tracing::debug;
-    use tracing::info;
-    use tracing::trace;
+    use tracing::{debug, info, trace};
     use tracing_subscriber::fmt::time::FormatTime;
 
     use super::*;
@@ -593,7 +590,8 @@ mod tests {
         }
     }
 
-    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in runtime.
+    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in
+    // runtime.
     extern "C" fn record_callback_with_filter_1(line: KernelStringSlice) {
         record_callback_with_filter(line, vec!["Testing 1\n", "Another line\n"])
     }
@@ -684,26 +682,6 @@ mod tests {
         );
     }
 
-    fn check_messages(
-        expected_lines: Vec<&str>,
-        expected_time_str: Option<String>,
-        expected_level_str: &str,
-    ) {
-        let lock = MESSAGES.lock().unwrap();
-        let Some(ref msgs) = *lock else {
-            panic!("Messages wasn't Some");
-        };
-        assert_eq!(msgs.len(), expected_lines.len());
-        for (got, expect) in msgs.iter().zip(expected_lines) {
-            assert!(got.ends_with(expect));
-            assert!(got.contains(expected_level_str));
-            assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-            if let Some(ref tstr) = expected_time_str {
-                assert!(got.contains(tstr));
-            }
-        }
-    }
-
     // IMPORTANT: This is the only test that should call the actual `extern "C"` function, as we can
     // only call it once to set the global subscriber. Other tests ALL need to use
     // `get_X_dispatcher` and set it locally using `with_default`
@@ -723,13 +701,14 @@ mod tests {
         ];
         // We registered record_callback_with_filter_1, which filters only the first two lines.
         let expected_lines = vec!["Testing 1\n", "Another line\n"];
-        let test_time_str = get_time_test_str();
+        let time_before = get_time_test_str();
         for line in &lines {
             // Remove final newline which will be added back by logging
             info!("{}", &line[..(line.len() - 1)]);
         }
+        let time_after = get_time_test_str();
 
-        check_messages(expected_lines, test_time_str, "INFO");
+        check_messages(expected_lines, &time_before, &time_after, "INFO");
         setup_messages();
 
         // Ensure we can setup again with a new callback and a new tracing level
@@ -739,13 +718,14 @@ mod tests {
         // Ensure both callback and tracing level are reloaded.
         // We registered record_callback_with_filter_2, which filters the other logging lines.
         let expected_lines = vec!["Testing 2\n", "Yet another line\n"];
-        let test_time_str = get_time_test_str();
+        let time_before = get_time_test_str();
         for line in &lines {
             debug!("{}", &line[..(line.len() - 1)]);
             // Trace must not be visible in messages, because we changed level to debug
             trace!("{}", &line[..(line.len() - 1)]);
         }
-        check_messages(expected_lines, test_time_str, "DEBUG");
+        let time_after = get_time_test_str();
+        check_messages(expected_lines, &time_before, &time_after, "DEBUG");
     }
 
     #[test]
@@ -792,7 +772,7 @@ mod tests {
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
         let events_str = events
             .iter()
-            .map(|(s, lvl)| format!("{}:{}", s, lvl))
+            .map(|(s, lvl)| format!("{s}:{lvl}"))
             .collect::<Vec<_>>()
             .join(", ");
         events_str
@@ -815,7 +795,7 @@ mod tests {
 
         // file path will use \ on windows
         use std::path::MAIN_SEPARATOR;
-        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+        let expected_file = format!("ffi{MAIN_SEPARATOR}src{MAIN_SEPARATOR}ffi_tracing.rs");
 
         let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
             && file == expected_file
@@ -873,7 +853,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there, however this test works if run individually.
+    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there,
+              // however this test works if run individually.
     fn test_enable_event_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
