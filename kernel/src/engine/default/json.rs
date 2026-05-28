@@ -660,7 +660,10 @@ mod tests {
         let (_temp_file2, file_url2) = make_invalid_named_temp();
         let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
         let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
-        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
+        let default_engine = DefaultEngine::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
 
         // Helper to check that we get expected number of errors then stream ends
         let check_errors = |file_urls: Vec<_>, expected_errors: usize| {
