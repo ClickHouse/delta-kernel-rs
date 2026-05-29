@@ -527,6 +527,20 @@ pub unsafe extern "C" fn builder_build(
     .into_extern_result(&builder_box.allocate_fn)
 }
 
+/// Free a builder created with [`get_engine_builder`] without building an engine. After calling,
+/// the passed pointer is _no longer valid_. Use this only when the builder will _not_ be passed to
+/// [`builder_build`] (which already consumes and frees it), for example to release the builder when
+/// configuring it fails.
+///
+/// # Safety
+///
+/// Caller is responsible to pass a valid EngineBuilder pointer, and to not use it again afterwards
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_engine_builder(builder: *mut EngineBuilder) {
+    let _ = unsafe { Box::from_raw(builder) };
+}
+
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
