@@ -543,6 +543,7 @@ pub unsafe extern "C" fn set_builder_option(
 ) -> ExternResult<bool> {
     set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
 }
+
 #[cfg(feature = "default-engine-base")]
 fn set_builder_option_impl(
     builder: &mut EngineBuilder,
