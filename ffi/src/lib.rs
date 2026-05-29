@@ -14,7 +14,7 @@ use std::sync::Arc;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -597,13 +597,17 @@ pub unsafe extern "C" fn builder_build(
     builder: *mut EngineBuilder,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { Box::from_raw(builder) };
-    get_default_engine_impl(
-        builder_box.url,
-        builder_box.options,
-        builder_box.multithreaded_executor_config,
-        builder_box.allocate_fn,
-    )
-    .into_extern_result(&builder_box.allocate_fn)
+    let allocate_fn = builder_box.allocate_fn;
+    unsafe {
+        catch_unwind_into_extern_result(&allocate_fn, move || {
+            get_default_engine_impl(
+                builder_box.url,
+                builder_box.options,
+                builder_box.multithreaded_executor_config,
+                builder_box.allocate_fn,
+            )
+        })
+    }
 }
 
 /// Free a builder created with [`get_engine_builder`] without building an engine. After calling,
@@ -618,6 +622,25 @@ pub unsafe extern "C" fn builder_build(
 #[no_mangle]
 pub unsafe extern "C" fn free_engine_builder(builder: *mut EngineBuilder) {
     let _ = unsafe { Box::from_raw(builder) };
+}
+
+/// Run `f`, catching any panic that would otherwise abort the process at the `extern "C"`
+/// boundary, and convert it into a kernel error. delta-kernel / arrow-rs / object-store / tokio
+/// can panic deep in the call stack: for example `object_store` unwraps an `InvalidHeaderValue`
+/// when a credential is valid UTF-8 but not a valid HTTP header value, the panic kills a
+/// `TokioBackgroundExecutor` worker, and the executor then panics on the calling thread. Without
+/// this guard that unwind reaches `panic_cannot_unwind` and aborts the server.
+///
+/// # Safety
+///
+/// The allocator must be valid.
+unsafe fn catch_unwind_into_extern_result<T>(
+    alloc: &dyn AllocateError,
+    f: impl FnOnce() -> DeltaResult<T>,
+) -> ExternResult<T> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(Error::generic("delta-kernel-rs panicked across the FFI boundary")));
+    unsafe { result.into_extern_result(alloc) }
 }
 
 /// # Safety
@@ -708,8 +731,114 @@ pub struct SharedSnapshot;
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
 
+/// Get the latest snapshot from the specified table
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine = unsafe { engine.as_ref() };
+    unsafe {
+        catch_unwind_into_extern_result(&engine, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            snapshot_impl(url, engine, None, Vec::new())
+        })
+    }
+}
+
 #[handle_descriptor(target=Metadata, mutable=false, sized=true)]
 pub struct SharedMetadata;
+
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+/// The log_paths array and its contents must remain valid for the duration of this call.
+#[cfg(feature = "catalog-managed")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_with_log_tail(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    log_paths: log_path::LogPathArray,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    unsafe {
+        catch_unwind_into_extern_result(&engine_ref, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let log_tail = unsafe { log_paths.log_paths() }?;
+            snapshot_impl(url, engine_ref, None, log_tail)
+        })
+    }
+}
+
+/// Get the snapshot from the specified table at a specific version. Note this is only safe for
+/// non-catalog-managed tables.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_at_version(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    version: Version,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine = unsafe { engine.as_ref() };
+    unsafe {
+        catch_unwind_into_extern_result(&engine, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            snapshot_impl(url, engine, version.into(), Vec::new())
+        })
+    }
+}
+
+/// Get the snapshot from the specified table at a specific version with log tail.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+/// The log_tail array and its contents must remain valid for the duration of this call.
+#[cfg(feature = "catalog-managed")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    version: Version,
+    log_tail: log_path::LogPathArray,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    unsafe {
+        catch_unwind_into_extern_result(&engine_ref, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let log_tail = unsafe { log_tail.log_paths() }?;
+            snapshot_impl(url, engine_ref, version.into(), log_tail)
+        })
+    }
+}
+
+fn snapshot_impl(
+    url: DeltaResult<Url>,
+    extern_engine: &dyn ExternEngine,
+    version: Option<Version>,
+    #[allow(unused_variables)] log_tail: Vec<LogPath>,
+) -> DeltaResult<Handle<SharedSnapshot>> {
+    let mut builder = Snapshot::builder_for(url?);
+
+    if let Some(v) = version {
+        builder = builder.at_version(v);
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    if !log_tail.is_empty() {
+        builder = builder.with_log_tail(log_tail);
+    }
+
+    let snapshot = builder.build(extern_engine.engine().as_ref())?;
+    Ok(snapshot.into())
+}
 
 /// Opaque builder for constructing a [`SharedSnapshot`].
 ///
