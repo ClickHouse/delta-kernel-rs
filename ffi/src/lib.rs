@@ -13,7 +13,7 @@ use url::Url;
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -519,12 +519,12 @@ pub unsafe extern "C" fn builder_build(
     builder: *mut EngineBuilder,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { Box::from_raw(builder) };
-    get_default_engine_impl(
-        builder_box.url,
-        builder_box.options,
-        builder_box.allocate_fn,
-    )
-    .into_extern_result(&builder_box.allocate_fn)
+    let allocate_fn = builder_box.allocate_fn;
+    unsafe {
+        catch_unwind_into_extern_result(&allocate_fn, move || {
+            get_default_engine_impl(builder_box.url, builder_box.options, builder_box.allocate_fn)
+        })
+    }
 }
 
 /// Free a builder created with [`get_engine_builder`] without building an engine. After calling,
@@ -539,6 +539,25 @@ pub unsafe extern "C" fn builder_build(
 #[no_mangle]
 pub unsafe extern "C" fn free_engine_builder(builder: *mut EngineBuilder) {
     let _ = unsafe { Box::from_raw(builder) };
+}
+
+/// Run `f`, catching any panic that would otherwise abort the process at the `extern "C"`
+/// boundary, and convert it into a kernel error. delta-kernel / arrow-rs / object-store / tokio
+/// can panic deep in the call stack: for example `object_store` unwraps an `InvalidHeaderValue`
+/// when a credential is valid UTF-8 but not a valid HTTP header value, the panic kills a
+/// `TokioBackgroundExecutor` worker, and the executor then panics on the calling thread. Without
+/// this guard that unwind reaches `panic_cannot_unwind` and aborts the server.
+///
+/// # Safety
+///
+/// The allocator must be valid.
+unsafe fn catch_unwind_into_extern_result<T>(
+    alloc: &dyn AllocateError,
+    f: impl FnOnce() -> DeltaResult<T>,
+) -> ExternResult<T> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(Error::generic("delta-kernel-rs panicked across the FFI boundary")));
+    unsafe { result.into_extern_result(alloc) }
 }
 
 /// # Safety
@@ -617,9 +636,13 @@ pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, None, Vec::new()).into_extern_result(&engine)
+    unsafe {
+        catch_unwind_into_extern_result(&engine, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            snapshot_impl(url, engine, None, Vec::new())
+        })
+    }
 }
 
 /// Get the latest snapshot from the specified table with optional log tail
@@ -635,16 +658,14 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     engine: Handle<SharedExternEngine>,
     log_paths: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
-
-    // Convert LogPathArray to Vec<LogPath>
-    let log_tail = match unsafe { log_paths.log_paths() } {
-        Ok(paths) => paths,
-        Err(err) => return Err(err).into_extern_result(&engine_ref),
-    };
-
-    snapshot_impl(url, engine_ref, None, log_tail).into_extern_result(&engine_ref)
+    unsafe {
+        catch_unwind_into_extern_result(&engine_ref, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let log_tail = unsafe { log_paths.log_paths() }?;
+            snapshot_impl(url, engine_ref, None, log_tail)
+        })
+    }
 }
 
 /// Get the snapshot from the specified table at a specific version. Note this is only safe for
@@ -659,9 +680,13 @@ pub unsafe extern "C" fn snapshot_at_version(
     engine: Handle<SharedExternEngine>,
     version: Version,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, version.into(), Vec::new()).into_extern_result(&engine)
+    unsafe {
+        catch_unwind_into_extern_result(&engine, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            snapshot_impl(url, engine, version.into(), Vec::new())
+        })
+    }
 }
 
 /// Get the snapshot from the specified table at a specific version with log tail.
@@ -678,16 +703,14 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     version: Version,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
-
-    // Convert LogPathArray to Vec<LogPath>
-    let log_tail = match unsafe { log_tail.log_paths() } {
-        Ok(paths) => paths,
-        Err(err) => return Err(err).into_extern_result(&engine_ref),
-    };
-
-    snapshot_impl(url, engine_ref, version.into(), log_tail).into_extern_result(&engine_ref)
+    unsafe {
+        catch_unwind_into_extern_result(&engine_ref, move || {
+            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let log_tail = unsafe { log_tail.log_paths() }?;
+            snapshot_impl(url, engine_ref, version.into(), log_tail)
+        })
+    }
 }
 
 fn snapshot_impl(
