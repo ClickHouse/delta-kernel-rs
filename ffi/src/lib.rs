@@ -639,7 +639,7 @@ pub unsafe extern "C" fn snapshot(
     let engine = unsafe { engine.as_ref() };
     unsafe {
         catch_unwind_into_extern_result(&engine, move || {
-            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let url = unwrap_and_parse_path_as_url(path);
             snapshot_impl(url, engine, None, Vec::new())
         })
     }
@@ -661,8 +661,8 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     let engine_ref = unsafe { engine.as_ref() };
     unsafe {
         catch_unwind_into_extern_result(&engine_ref, move || {
-            let url = unsafe { unwrap_and_parse_path_as_url(path) };
-            let log_tail = unsafe { log_paths.log_paths() }?;
+            let url = unwrap_and_parse_path_as_url(path);
+            let log_tail = log_paths.log_paths()?;
             snapshot_impl(url, engine_ref, None, log_tail)
         })
     }
@@ -683,7 +683,7 @@ pub unsafe extern "C" fn snapshot_at_version(
     let engine = unsafe { engine.as_ref() };
     unsafe {
         catch_unwind_into_extern_result(&engine, move || {
-            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let url = unwrap_and_parse_path_as_url(path);
             snapshot_impl(url, engine, version.into(), Vec::new())
         })
     }
@@ -706,8 +706,8 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     let engine_ref = unsafe { engine.as_ref() };
     unsafe {
         catch_unwind_into_extern_result(&engine_ref, move || {
-            let url = unsafe { unwrap_and_parse_path_as_url(path) };
-            let log_tail = unsafe { log_tail.log_paths() }?;
+            let url = unwrap_and_parse_path_as_url(path);
+            let log_tail = log_tail.log_paths()?;
             snapshot_impl(url, engine_ref, version.into(), log_tail)
         })
     }

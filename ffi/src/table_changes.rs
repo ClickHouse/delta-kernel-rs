@@ -48,7 +48,7 @@ pub unsafe extern "C" fn table_changes_from_version(
     let engine = unsafe { engine.as_ref() };
     unsafe {
         catch_unwind_into_extern_result(&engine, move || {
-            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let url = unwrap_and_parse_path_as_url(path);
             table_changes_impl(url, engine, start_version, None)
         })
     }
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn table_changes_between_versions(
     let engine = unsafe { engine.as_ref() };
     unsafe {
         catch_unwind_into_extern_result(&engine, move || {
-            let url = unsafe { unwrap_and_parse_path_as_url(path) };
+            let url = unwrap_and_parse_path_as_url(path);
             table_changes_impl(url, engine, start_version, end_version.into())
         })
     }
