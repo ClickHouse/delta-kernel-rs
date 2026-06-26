@@ -996,7 +996,11 @@ pub unsafe extern "C" fn snapshot_builder_build(
     let engine_arc = unsafe { builder.as_mut() }.engine.clone();
     let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
-    snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
+    unsafe {
+        catch_unwind_into_extern_result(&engine_ref, move || {
+            snapshot_builder_build_impl(*builder_box)
+        })
+    }
 }
 
 fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
