@@ -62,3 +62,10 @@ default-engine-base = ["delta_kernel/default-engine-base"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Gates the catalog-managed snapshot exports (`snapshot_with_log_tail`,
+# `snapshot_at_version_with_log_tail`). Off by default: the log-tail builder API
+# (`snapshot_builder_set_log_tail`) covers the same functionality and is always
+# compiled. Declaring the feature keeps `#[cfg(feature = "catalog-managed")]` from
+# tripping the `unexpected_cfgs` lint.
+catalog-managed = []
