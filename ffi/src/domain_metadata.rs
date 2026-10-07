@@ -37,6 +37,39 @@ fn get_domain_metadata_impl(
         .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
 }
 
+/// Get the domain metadata including system-controlled (`delta.*`) domains.
+/// Unlike `get_domain_metadata`, this does not reject `delta.*` domains.
+/// This is needed to read metadata such as `delta.clustering`.
+///
+/// # Safety
+///
+/// Caller is responsible for passing in a valid handle
+#[no_mangle]
+pub unsafe extern "C" fn get_domain_metadata_internal(
+    snapshot: Handle<SharedSnapshot>,
+    domain: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    allocate_fn: AllocateStringFn,
+) -> ExternResult<NullableCvoid> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let domain = unsafe { String::try_from_slice(&domain) };
+
+    get_domain_metadata_internal_impl(snapshot, domain, engine, allocate_fn)
+        .into_extern_result(&engine)
+}
+
+fn get_domain_metadata_internal_impl(
+    snapshot: &Snapshot,
+    domain: DeltaResult<String>,
+    extern_engine: &dyn ExternEngine,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    Ok(snapshot
+        .get_domain_metadata_internal(&domain?, extern_engine.engine().as_ref())?
+        .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
+}
+
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific domain in this snapshot
 ///
 /// # Safety
@@ -252,6 +285,28 @@ mod tests {
             collected_metadata.get("domain2").unwrap(),
             "domain2_commit1"
         );
+
+        // Test get_domain_metadata_internal (allows delta.* domains)
+        let get_internal_helper = |domain: &str| unsafe {
+            get_domain_metadata_internal(
+                snapshot.shallow_copy(),
+                kernel_string_slice!(domain),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        };
+
+        // delta.* domains succeed via the internal API
+        let res = ok_or_panic(get_internal_helper("delta.domain3"));
+        assert_eq!(recover_string(res.unwrap()), "domain3_commit1");
+
+        // Regular domains also work
+        let res = ok_or_panic(get_internal_helper("domain2"));
+        assert_eq!(recover_string(res.unwrap()), "domain2_commit1");
+
+        // Removed domain returns None
+        let res = ok_or_panic(get_internal_helper("domain1"));
+        assert!(res.is_none());
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }

@@ -208,6 +208,7 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             // physical name mapping has been performed. Because we currently lack both the
             // validation and the name mapping support, we must disable this optimization for the
             // time being. See https://github.com/delta-io/delta-kernel-rs/issues/434.
+            #[allow(unknown_lints, clippy::some_filter)]
             return Some(self.get_parquet_rowcount_stat()).filter(|_| false);
         };
 

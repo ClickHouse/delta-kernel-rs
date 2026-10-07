@@ -54,7 +54,7 @@ bool scan_row_callback(
   int64_t mod_time,
   const Stats* stats,
   HandleSharedDvInfo dv_info,
-  OptionalValue_HandleSharedExpression transform,
+  OptionalValueHandleSharedExpression transform,
   const CStringMap* partition_values)
 {
   (void)mod_time; // not using this at the moment
@@ -74,8 +74,8 @@ bool scan_row_callback(
     if (selection_vector_res.tag != OkKernelBoolSlice) {
       printf("Could not get selection vector from kernel\n");
       free_kernel_dv_info(dv_info);
-      if (transform.tag == OptionalValue_HandleSharedExpression_Tag_Some) {
-        free_kernel_expression(transform.some._0);
+      if (transform.tag == SomeHandleSharedExpression) {
+        free_kernel_expression(transform.some);
       }
       exit(-1);
     }
@@ -94,8 +94,8 @@ bool scan_row_callback(
   print_partition_info(context, partition_values);
 #ifdef PRINT_ARROW_DATA
   const Expression* transform_expr = NULL;
-  if (transform.tag == OptionalValue_HandleSharedExpression_Tag_Some) {
-    transform_expr = (const Expression*)transform.some._0;
+  if (transform.tag == SomeHandleSharedExpression) {
+    transform_expr = (const Expression*)transform.some;
   }
   c_read_parquet_file(context, path, selection_vector, transform_expr);
 #endif
@@ -103,8 +103,8 @@ bool scan_row_callback(
   context->partition_values = NULL;
 
   free_kernel_dv_info(dv_info);
-  if (transform.tag == OptionalValue_HandleSharedExpression_Tag_Some) {
-    free_kernel_expression(transform.some._0);
+  if (transform.tag == SomeHandleSharedExpression) {
+    free_kernel_expression(transform.some);
   }
 
   return true; // Continue iteration

@@ -522,7 +522,11 @@ pub unsafe extern "C" fn builder_build(
     let allocate_fn = builder_box.allocate_fn;
     unsafe {
         catch_unwind_into_extern_result(&allocate_fn, move || {
-            get_default_engine_impl(builder_box.url, builder_box.options, builder_box.allocate_fn)
+            get_default_engine_impl(
+                builder_box.url,
+                builder_box.options,
+                builder_box.allocate_fn,
+            )
         })
     }
 }
@@ -555,8 +559,11 @@ unsafe fn catch_unwind_into_extern_result<T>(
     alloc: &dyn AllocateError,
     f: impl FnOnce() -> DeltaResult<T>,
 ) -> ExternResult<T> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .unwrap_or_else(|_| Err(Error::generic("delta-kernel-rs panicked across the FFI boundary")));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        Err(Error::generic(
+            "delta-kernel-rs panicked across the FFI boundary",
+        ))
+    });
     unsafe { result.into_extern_result(alloc) }
 }
 
