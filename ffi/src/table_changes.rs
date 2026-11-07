@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::table_changes::scan::TableChangesScan;
+use delta_kernel::table_changes::scan::{CdfReadFile, TableChangesScan};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, EngineData, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -15,11 +15,12 @@ use url::Url;
 use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
+use crate::expressions::SharedExpression;
 use crate::scan::EnginePredicate;
 use crate::{
     catch_unwind_into_extern_result, kernel_string_slice, unwrap_and_parse_path_as_url,
     AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -349,6 +350,137 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
         array: out_array,
         schema: out_schema,
     })))
+}
+
+type CdfReadFiles = Mutex<Box<dyn Iterator<Item = DeltaResult<CdfReadFile>> + Send>>;
+
+/// An iterator over the data files of a table changes scan, which the engine reads itself.
+pub struct TableChangesScanFilesIterator {
+    files: CdfReadFiles,
+    engine: Arc<dyn ExternEngine>,
+}
+
+#[handle_descriptor(target=TableChangesScanFilesIterator, mutable=false, sized=true)]
+pub struct SharedTableChangesScanFilesIterator;
+
+/// A callback that receives one data file of a table changes scan. The arguments are:
+/// - `engine_context`: the context passed to [`table_changes_scan_files_next`].
+/// - `path`: the path of the file, relative to the table root, or an absolute URL.
+/// - `size`: the size of the file in bytes, or -1 if unknown.
+/// - `is_cdc`: whether this is a CDC file, which contains the `_change_type` column physically in
+///   addition to the columns of [`table_changes_scan_physical_schema`].
+/// - `transform`: the expression from the physical data of the file to the logical schema of the
+///   scan, if any. The engine owns the handle and must free it.
+/// - `row_indexes`, `row_indexes_len`: row indexes (ascending) selected or excluded by deletion
+///   vectors, valid only during the call. If `row_indexes_len` is 0, all rows are selected.
+/// - `row_indexes_are_selection`: if true, only the rows in `row_indexes` are in the change data
+///   feed; if false, the rows in `row_indexes` are excluded and all other rows are in it.
+type CCdfScanFileCallback = extern "C" fn(
+    engine_context: NullableCvoid,
+    path: KernelStringSlice,
+    size: i64,
+    is_cdc: bool,
+    transform: OptionalValue<Handle<SharedExpression>>,
+    row_indexes: *const u64,
+    row_indexes_len: usize,
+    row_indexes_are_selection: bool,
+);
+
+/// Get an iterator over the data files of a table changes scan, to read them with the engine's
+/// own Parquet reader instead of [`table_changes_scan_execute`]. Pass it to
+/// [`table_changes_scan_files_next`] and free it with [`free_table_changes_scan_files_iter`].
+///
+/// # Safety
+///
+/// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedTableChangesScan`]
+#[no_mangle]
+pub unsafe extern "C" fn table_changes_scan_files_iter_init(
+    table_changes_scan: Handle<SharedTableChangesScan>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedTableChangesScanFilesIterator>> {
+    let table_changes_scan = unsafe { table_changes_scan.as_ref() };
+    let engine = unsafe { engine.clone_as_arc() };
+    let engine_for_impl = engine.clone();
+    unsafe {
+        catch_unwind_into_extern_result(&engine.as_ref(), move || {
+            table_changes_scan_files_iter_init_impl(table_changes_scan, engine_for_impl)
+        })
+    }
+}
+
+fn table_changes_scan_files_iter_init_impl(
+    table_changes_scan: &TableChangesScan,
+    engine: Arc<dyn ExternEngine>,
+) -> DeltaResult<Handle<SharedTableChangesScanFilesIterator>> {
+    let files = table_changes_scan.scan_files(engine.engine().clone())?;
+    let iter = TableChangesScanFilesIterator {
+        files: Mutex::new(Box::new(files)),
+        engine,
+    };
+    Ok(Arc::new(iter).into())
+}
+
+/// Get the next data file from the iterator and pass it to `callback`. Returns `Ok(true)` if the
+/// callback was called, `Ok(false)` if the iterator is exhausted, or `Err` on failure.
+///
+/// # Safety
+///
+/// The iterator must be valid (returned by [`table_changes_scan_files_iter_init`]) and not yet
+/// freed by [`free_table_changes_scan_files_iter`].
+#[no_mangle]
+pub unsafe extern "C" fn table_changes_scan_files_next(
+    data: Handle<SharedTableChangesScanFilesIterator>,
+    engine_context: NullableCvoid,
+    callback: CCdfScanFileCallback,
+) -> ExternResult<bool> {
+    let data = unsafe { data.as_ref() };
+    unsafe {
+        catch_unwind_into_extern_result(&data.engine.as_ref(), move || {
+            table_changes_scan_files_next_impl(data, engine_context, callback)
+        })
+    }
+}
+
+fn table_changes_scan_files_next_impl(
+    data: &TableChangesScanFilesIterator,
+    engine_context: NullableCvoid,
+    callback: CCdfScanFileCallback,
+) -> DeltaResult<bool> {
+    let mut files = data
+        .files
+        .lock()
+        .map_err(|_| Error::generic("poisoned table changes scan files iterator mutex"))?;
+    let Some(file) = files.next().transpose()? else {
+        return Ok(false);
+    };
+    let path = file.path.as_str();
+    let row_indexes = file.row_indexes.as_deref().unwrap_or_default();
+    let transform: OptionalValue<Handle<SharedExpression>> =
+        file.transform.clone().map(Into::into).into();
+    callback(
+        engine_context,
+        kernel_string_slice!(path),
+        file.size.unwrap_or(-1),
+        file.is_cdc,
+        transform,
+        row_indexes.as_ptr(),
+        row_indexes.len(),
+        file.row_indexes_are_selection,
+    );
+    Ok(true)
+}
+
+/// Drops a table changes scan files iterator.
+///
+/// # Safety
+///
+/// Caller is responsible for (at most once) passing a valid pointer returned by a call to
+/// [`table_changes_scan_files_iter_init`].
+#[no_mangle]
+pub unsafe extern "C" fn free_table_changes_scan_files_iter(
+    data: Handle<SharedTableChangesScanFilesIterator>,
+) {
+    data.drop_handle();
 }
 
 #[cfg(test)]

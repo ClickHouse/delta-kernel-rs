@@ -2,20 +2,23 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use url::Url;
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
-use super::scan_file::scan_metadata_to_scan_file;
+use super::resolve_dvs::{
+    resolve_scan_file_dv, resolve_scan_file_dv_rows, ResolvedCdfScanFile, ResolvedCdfScanFileRows,
+};
+use super::scan_file::{scan_metadata_to_scan_file, CdfScanFileType};
 use super::TableChanges;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PhysicalPredicate, StatsOutputMode};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -189,6 +192,31 @@ impl TableChangesScan {
         }
     }
 
+    /// Get the data files that make up the change data feed, without reading them. Each file comes
+    /// with the transform from its physical data to the logical schema of the scan and with the
+    /// rows selected by its deletion vectors, so that an engine can read the files with its own
+    /// Parquet reader and get the same result as [`TableChangesScan::execute`]. Deletion vectors
+    /// are read with the `engine`.
+    #[internal_api]
+    pub(crate) fn scan_files(
+        &self,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<CdfReadFile>> + Send> {
+        let scan_metadata = self.scan_metadata(engine.clone())?;
+        let scan_files = scan_metadata_to_scan_file(scan_metadata);
+        let table_root = self.table_changes.table_root().clone();
+        let state = CdfReadFileState {
+            state_info: self.state_info.clone(),
+        };
+        let result = scan_files
+            .map(move |scan_file| {
+                resolve_scan_file_dv_rows(engine.as_ref(), &table_root, scan_file?)
+            }) // Iterator-Result-Iterator
+            .flatten_ok() // Iterator-Result
+            .map(move |resolved| state.make_read_file(resolved?));
+        Ok(result)
+    }
+
     /// Perform an "all in one" scan to get the change data feed. This will use the provided
     /// `engine` to read and process all the data for the query. Each [`EngineData`] in the
     /// resultant iterator is a portion of the final set of data.
@@ -224,6 +252,57 @@ impl TableChangesScan {
             .map(|x| x?); // Iterator-Result
 
         Ok(result)
+    }
+}
+
+/// A data file of the change data feed, with everything that an engine needs to read it with its
+/// own Parquet reader. Returned by [`TableChangesScan::scan_files`].
+#[internal_api]
+#[derive(Debug, Clone)]
+pub(crate) struct CdfReadFile {
+    /// The path of the data file, relative to the table root, or an absolute URL.
+    pub path: String,
+    /// The size of the data file in bytes, if known.
+    pub size: Option<i64>,
+    /// Whether this is a CDC file (a `cdc` action). A CDC file contains the `_change_type` column
+    /// physically, in addition to the columns of [`TableChangesScan::physical_schema`].
+    pub is_cdc: bool,
+    /// The expression that transforms the data read from the file into the logical schema of
+    /// the scan: it adds partition values and the `_change_type`, `_commit_version` and
+    /// `_commit_timestamp` columns. `None` if no transformation is needed.
+    pub transform: Option<ExpressionRef>,
+    /// Row indexes (in ascending order) that the deletion vectors select or exclude. If `None`,
+    /// all rows of the file are in the change data feed. It is never empty.
+    pub row_indexes: Option<Vec<u64>>,
+    /// If `true`, only the rows in `row_indexes` are in the change data feed. If `false`, the rows
+    /// in `row_indexes` are deleted and not in the change data feed, and all other rows are.
+    pub row_indexes_are_selection: bool,
+}
+
+/// Per-scan state that is needed to build the [`CdfReadFile`]s.
+struct CdfReadFileState {
+    state_info: Arc<StateInfo>,
+}
+
+impl CdfReadFileState {
+    fn make_read_file(&self, resolved: ResolvedCdfScanFileRows) -> DeltaResult<CdfReadFile> {
+        let ResolvedCdfScanFileRows {
+            scan_file,
+            rows,
+            rows_are_selection,
+        } = resolved;
+        let physical_schema =
+            scan_file_physical_schema(&scan_file, self.state_info.physical_schema.as_ref());
+        let transform =
+            get_cdf_transform_expr(&scan_file, &self.state_info, physical_schema.as_ref())?;
+        Ok(CdfReadFile {
+            is_cdc: scan_file.scan_type == CdfScanFileType::Cdc,
+            size: scan_file.size,
+            path: scan_file.path,
+            transform,
+            row_indexes: rows.map(|rows| rows.iter().collect()),
+            row_indexes_are_selection: rows_are_selection,
+        })
     }
 }
 
