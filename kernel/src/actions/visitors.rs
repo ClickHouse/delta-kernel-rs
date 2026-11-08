@@ -98,6 +98,7 @@ pub(crate) struct AddVisitor {
 }
 
 impl AddVisitor {
+    #[allow(dead_code)]
     #[internal_api]
     fn visit_add<'a>(
         row_index: usize,
@@ -141,6 +142,7 @@ impl AddVisitor {
             clustering_provider,
         })
     }
+    #[allow(dead_code)]
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| Add::to_schema().leaves(ADD_NAME));
@@ -171,6 +173,7 @@ pub(crate) struct RemoveVisitor {
 }
 
 impl RemoveVisitor {
+    #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn visit_remove<'a>(
         row_index: usize,
@@ -217,6 +220,7 @@ impl RemoveVisitor {
             default_row_commit_version,
         })
     }
+    #[allow(dead_code)]
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| Remove::to_schema().leaves(REMOVE_NAME));
@@ -247,6 +251,7 @@ pub(crate) struct CdcVisitor {
 }
 
 impl CdcVisitor {
+    #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn visit_cdc<'a>(
         row_index: usize,
@@ -826,7 +831,7 @@ mod tests {
         };
         let expected = vec![add1, add2, add3];
         assert_eq!(add_visitor.adds.len(), expected.len());
-        for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected) {
             assert_eq!(add, expected);
         }
     }

@@ -475,6 +475,21 @@ impl Snapshot {
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 
+    /// Fetch the domainMetadata for a specific domain, including system-controlled (`delta.*`)
+    /// domains. Unlike [`get_domain_metadata`], internal domains are allowed.
+    ///
+    /// This is needed to read metadata such as `delta.clustering` which stores the clustering
+    /// columns for liquid-clustered tables.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    pub fn get_domain_metadata_internal(
+        &self,
+        domain: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
+        domain_metadata_configuration(self.log_segment(), domain, engine)
+    }
+
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_domain_metadata(
@@ -1275,6 +1290,22 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+
+        // Test get_domain_metadata_internal (allows delta.* domains)
+        assert_eq!(
+            snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
+            Some("domain3_commit1".to_string())
+        );
+        // Also works for regular domains
+        assert_eq!(
+            snapshot.get_domain_metadata_internal("domain2", &engine)?,
+            Some("domain2_commit1".to_string())
+        );
+        // Removed domain returns None
+        assert_eq!(
+            snapshot.get_domain_metadata_internal("domain1", &engine)?,
+            None
+        );
 
         // Test get_all_domain_metadata
         let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
