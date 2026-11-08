@@ -1,3 +1,4 @@
+use roaring::RoaringTreemap;
 use url::Url;
 
 use super::scan_file::CdfScanFileType;
@@ -38,6 +39,52 @@ pub(crate) fn resolve_scan_file_dv(
     table_root: &Url,
     scan_file: CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+    let resolved = resolve_scan_file_dv_rows(engine, table_root, scan_file)?;
+    Ok(resolved.map(|resolved| {
+        let ResolvedCdfScanFileRows {
+            scan_file,
+            rows,
+            rows_are_selection,
+        } = resolved;
+        let selection_vector = rows.map(|rows| {
+            if rows_are_selection {
+                selection_treemap_to_bools(rows)
+            } else {
+                deletion_treemap_to_bools(rows)
+            }
+        });
+        ResolvedCdfScanFile {
+            scan_file,
+            selection_vector,
+        }
+    }))
+}
+
+/// A [`CdfScanFile`] with the set of rows that its deletion vectors select or exclude. The
+/// `scan_type` is resolved to match the `_change_type` that its rows will have in the change data
+/// feed. This is the same as [`ResolvedCdfScanFile`], but keeps the row indexes as a treemap
+/// instead of a selection vector, for engines that read the data files themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedCdfScanFileRows {
+    /// The scan file that holds the path the data file to be read. The `scan_type` field is
+    /// resolved to the `_change_type` of the rows for this data file.
+    pub(crate) scan_file: CdfScanFile,
+    /// Optional set of row indexes. If `None`, all rows of the data file are in the change data
+    /// feed. Otherwise its meaning depends on `rows_are_selection`. It is never empty.
+    pub(crate) rows: Option<RoaringTreemap>,
+    /// If `true`, only the rows in `rows` are in the change data feed (the file was paired with a
+    /// remove deletion vector). If `false`, `rows` are the deleted rows, which are not in the
+    /// change data feed, and all other rows are.
+    pub(crate) rows_are_selection: bool,
+}
+
+/// Resolves the deletion vectors for a [`CdfScanFile`] into sets of row indexes. See
+/// [`resolve_scan_file_dv`] for the two cases that it handles.
+pub(crate) fn resolve_scan_file_dv_rows(
+    engine: &dyn Engine,
+    table_root: &Url,
+    scan_file: CdfScanFile,
+) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFileRows>> {
     let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
     let rm_dv = scan_file
         .remove_dv
@@ -128,27 +175,21 @@ pub(crate) fn resolve_scan_file_dv(
             (None, Some(rm_dv.unwrap_or_else(Default::default)))
         }
     };
-    let treemap_to_bools = if scan_file.remove_dv.is_some() {
-        selection_treemap_to_bools
-    } else {
-        deletion_treemap_to_bools
-    };
-
-    let resolve = |scan_file, sv: Vec<bool>| ResolvedCdfScanFile {
+    let rows_are_selection = scan_file.remove_dv.is_some();
+    let resolve = |scan_file, rows: RoaringTreemap| ResolvedCdfScanFileRows {
         scan_file,
-        selection_vector: (!sv.is_empty()).then_some(sv),
+        rows: (!rows.is_empty()).then_some(rows),
+        rows_are_selection,
     };
 
-    let removes = rm_dv.map(treemap_to_bools).map(|sv| {
+    let removes = rm_dv.map(|rows| {
         let scan_file = CdfScanFile {
             scan_type: CdfScanFileType::Remove,
             ..scan_file.clone()
         };
-        resolve(scan_file, sv)
+        resolve(scan_file, rows)
     });
-    let adds = add_dv
-        .map(treemap_to_bools)
-        .map(|sv| resolve(scan_file, sv));
+    let adds = add_dv.map(|rows| resolve(scan_file, rows));
     Ok([removes, adds].into_iter().flatten())
 }
 
