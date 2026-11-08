@@ -119,11 +119,9 @@ pub mod tokio {
 
             let fut = Box::pin(async move {
                 let task_output = task.await;
-                tokio::task::spawn_blocking(move || {
-                    sender.send(task_output).ok();
-                })
-                .await
-                .unwrap();
+                // `std::sync::mpsc::Sender::send` never waits for channel capacity, so this
+                // synchronous handoff is safe to do directly from the async task.
+                sender.send(task_output).ok();
             });
 
             self.send_future(fut);
@@ -169,9 +167,6 @@ pub mod tokio {
     }
 
     impl TaskExecutor for TokioMultiThreadExecutor {
-        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
-        // See:
-        // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
         fn block_on<T>(&self, task: T) -> T::Output
         where
             T: Future + Send + 'static,
@@ -184,11 +179,9 @@ pub mod tokio {
 
             let fut = Box::pin(async move {
                 let task_output = task.await;
-                tokio::task::spawn_blocking(move || {
-                    sender.send(task_output).ok();
-                })
-                .await
-                .unwrap();
+                // `std::sync::mpsc::Sender::send` never waits for channel capacity, so this
+                // synchronous handoff is safe to do directly from the async task.
+                sender.send(task_output).ok();
             });
 
             // We throw away the handle, but it should continue on.
@@ -287,6 +280,57 @@ pub mod tokio {
                 .expect("Timeout - likely deadlock in TokioMultiThreadExecutor::block_on");
             assert_eq!(result, 43);
             handle.join().expect("thread panicked");
+        }
+
+        #[test]
+        fn test_small_blocking_pool_completes_many_block_on_calls() {
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime");
+            let executor = Arc::new(TokioMultiThreadExecutor::new(runtime.handle().clone()));
+
+            let (tx, rx) = channel::<i32>();
+            let handles = executor.block_on({
+                let executor = executor.clone();
+                let tx = tx.clone();
+                async move {
+                    let mut handles = Vec::new();
+                    for value in 0..8 {
+                        let executor = executor.clone();
+                        let tx = tx.clone();
+                        handles.push(tokio::task::spawn_blocking(move || {
+                            let result = executor.block_on(async move {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                value
+                            });
+                            tx.send(result).ok();
+                        }));
+                    }
+                    handles
+                }
+            });
+            drop(tx);
+
+            let mut results = Vec::new();
+            for _ in 0..handles.len() {
+                results.push(
+                    rx.recv_timeout(Duration::from_secs(5))
+                        .expect("Timeout - likely deadlock in TokioMultiThreadExecutor::block_on"),
+                );
+            }
+
+            for handle in handles {
+                executor.block_on(handle).expect("blocking task panicked");
+            }
+
+            results.sort_unstable();
+            assert_eq!(results, (0..8).collect::<Vec<_>>());
         }
     }
 }
