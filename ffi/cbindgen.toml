@@ -6,6 +6,11 @@ language = "C"
 
 pragma_once = true
 
+# Pass `--filter-platform $TARGET` to the `cargo metadata` run by cbindgen. Without it, that `cargo`
+# probes the host `rustc` with the target flags it inherits from `CARGO_ENCODED_RUSTFLAGS`, which
+# fails when cross-compiling (e.g. `-C target-cpu=x86-64-v3` on an aarch64 host).
+only_target_dependencies = true
+
 # only applies to Cxx
 namespace = "ffi"
 cpp_compat = true
