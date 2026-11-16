@@ -418,6 +418,24 @@ impl<'a> DataSkippingPredicateCreator<'a> {
     fn guard_for_removes(&self, pred: Pred) -> Pred {
         Pred::or(Pred::not(Pred::from(column_name!("is_add"))), pred)
     }
+
+    /// Keeps the file when the min/max stats of `col` are inverted: such stats bound no value.
+    /// FALSE, not NULL, when either stat is missing, so missing stats prune as before.
+    fn guard_for_inverted_stats(
+        &self,
+        col: &ColumnName,
+        data_type: &DataType,
+        cmp: Pred,
+    ) -> Option<Pred> {
+        let min = self.get_min_stat(col, data_type)?;
+        let max = self.get_max_stat(col, data_type)?;
+        let inverted = Pred::and_from([
+            Pred::is_not_null(min.clone()),
+            Pred::is_not_null(max.clone()),
+            Pred::lt(max, min),
+        ]);
+        Some(Pred::or(cmp, inverted))
+    }
 }
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
@@ -444,6 +462,21 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         }
     }
 
+    fn partial_cmp_min_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let min = self.get_min_stat(col, &val.data_type())?;
+        let cmp = self.eval_partial_cmp(ord, min, val, inverted)?;
+        if self.is_partition_column(col) {
+            return Some(cmp);
+        }
+        self.guard_for_inverted_stats(col, &val.data_type(), cmp)
+    }
+
     /// Compares a column's max stat against a literal value, adjusting for timestamp
     /// truncation on non-partition columns. Partition values are exact and not subject to
     /// JSON stats truncation, so no adjustment is needed. For data columns, the comparison
@@ -460,7 +493,8 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             return self.eval_partial_cmp(ord, max, val, inverted);
         }
         let adjusted = adjust_scalar_for_max_stat_truncation(val);
-        self.eval_partial_cmp(ord, max, &adjusted, inverted)
+        let cmp = self.eval_partial_cmp(ord, max, &adjusted, inverted)?;
+        self.guard_for_inverted_stats(col, &val.data_type(), cmp)
     }
 
     /// Retrieves the null count of a column. Partition columns don't have nullCount stats.

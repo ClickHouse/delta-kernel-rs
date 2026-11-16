@@ -109,6 +109,10 @@ fn test_eval_binary_comparisons() {
 
     // min < value < max (5..15 = 10, 5..15 <= 10, etc)
     do_test(five, fifteen, &[TRUE, TRUE, TRUE, TRUE, TRUE, TRUE]);
+
+    // inverted stats bound nothing (15..5 = 10, 15..10 = 10, etc)
+    do_test(fifteen, five, &[TRUE, TRUE, TRUE, TRUE, TRUE, TRUE]);
+    do_test(fifteen, ten, &[TRUE; 6]);
 }
 
 #[test]
@@ -362,6 +366,52 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
 
+// Inverted stats (min > max) never skip a file; a file with only one stat still prunes.
+#[rstest]
+#[case::eq_min(Pred::eq(column_expr!("k"), Expr::literal(1i64)), Some(9), Some(1), TRUE)]
+#[case::eq_max(Pred::eq(column_expr!("k"), Expr::literal(5i64)), Some(9), Some(1), TRUE)]
+#[case::between(
+    Pred::and(
+        Pred::ge(column_expr!("k"), Expr::literal(1i64)),
+        Pred::le(column_expr!("k"), Expr::literal(2i64)),
+    ),
+    Some(9),
+    Some(1),
+    TRUE
+)]
+#[case::lt(Pred::lt(column_expr!("k"), Expr::literal(3i64)), Some(9), Some(1), TRUE)]
+#[case::gt(Pred::gt(column_expr!("k"), Expr::literal(3i64)), Some(9), Some(1), TRUE)]
+#[case::not_gt(
+    Pred::not(Pred::gt(column_expr!("k"), Expr::literal(3i64))),
+    Some(9),
+    Some(1),
+    TRUE
+)]
+#[case::consistent(Pred::eq(column_expr!("k"), Expr::literal(1i64)), Some(3), Some(4), FALSE)]
+#[case::min_only(Pred::eq(column_expr!("k"), Expr::literal(1i64)), Some(9), None, FALSE)]
+#[case::max_only(Pred::eq(column_expr!("k"), Expr::literal(10i64)), None, Some(1), FALSE)]
+fn test_sql_where_inverted_stats(
+    #[case] pred: Pred,
+    #[case] min: Option<i64>,
+    #[case] max: Option<i64>,
+    #[case] expected: Option<bool>,
+) {
+    let stat = |v: Option<i64>| v.map_or(Scalar::Null(DataType::LONG), Scalar::from);
+    let resolver = HashMap::from_iter([
+        (column_name!("stats_parsed.numRecords"), Scalar::from(5i64)),
+        (column_name!("stats_parsed.nullCount.k"), Scalar::from(0i64)),
+        (column_name!("stats_parsed.minValues.k"), stat(min)),
+        (column_name!("stats_parsed.maxValues.k"), stat(max)),
+    ]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    let skipping_pred = as_sql_data_skipping_predicate(&pred, &Default::default()).unwrap();
+    expect_eq!(
+        filter.eval(&skipping_pred),
+        expected,
+        "{pred:#?} became {skipping_pred:#?} with [{min:?}..{max:?}]"
+    );
+}
+
 #[test]
 fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();
@@ -563,48 +613,63 @@ fn test_timestamp_predicates_use_adjusted_max_stats(
 ) {
     let col = &column_expr!("ts_col");
 
+    // Every data-column leg also keeps the file when the column's stats are inverted.
+    let guarded = |leg: &str| {
+        format!(
+            "OR({leg}, AND(NOT(Column(stats_parsed.minValues.ts_col) IS NULL), \
+             NOT(Column(stats_parsed.maxValues.ts_col) IS NULL), \
+             Column(stats_parsed.maxValues.ts_col) < Column(stats_parsed.minValues.ts_col)))"
+        )
+    };
+
     // LT uses minValues (no adjustment needed for min stats)
     let pred = Pred::lt(col.clone(), timestamp.clone());
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
-        "Column(stats_parsed.minValues.ts_col) < 1000000"
+        guarded("Column(stats_parsed.minValues.ts_col) < 1000000")
     );
 
     // GT uses maxValues with adjusted literal (1000000 - 999 = 999001)
     let pred = Pred::gt(col.clone(), timestamp.clone());
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
-        "Column(stats_parsed.maxValues.ts_col) > 999001"
+        guarded("Column(stats_parsed.maxValues.ts_col) > 999001")
     );
 
     // EQ uses both min (unadjusted) and max (adjusted)
     let pred = Pred::eq(col.clone(), timestamp.clone());
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
-        "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), \
-         NOT(Column(stats_parsed.maxValues.ts_col) < 999001))"
+        format!(
+            "AND({}, {})",
+            guarded("NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"),
+            guarded("NOT(Column(stats_parsed.maxValues.ts_col) < 999001)")
+        )
     );
 
     // NE uses both min (unadjusted) and max (adjusted)
     let pred = Pred::ne(col.clone(), timestamp.clone());
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
-        "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), \
-         NOT(Column(stats_parsed.maxValues.ts_col) = 999001))"
+        format!(
+            "OR({}, {})",
+            guarded("NOT(Column(stats_parsed.minValues.ts_col) = 1000000)"),
+            guarded("NOT(Column(stats_parsed.maxValues.ts_col) = 999001)")
+        )
     );
 
     // GE (col >= val) uses maxValues with adjusted literal
     let pred = Pred::ge(col.clone(), timestamp.clone());
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
-        "NOT(Column(stats_parsed.maxValues.ts_col) < 999001)"
+        guarded("NOT(Column(stats_parsed.maxValues.ts_col) < 999001)")
     );
 
     // LE (col <= val) uses minValues only (no adjustment needed)
     let pred = Pred::le(col.clone(), timestamp.clone());
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
-        "NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"
+        guarded("NOT(Column(stats_parsed.minValues.ts_col) > 1000000)")
     );
 }
 
@@ -637,6 +702,10 @@ fn mixed_resolver(
         (
             column_name!("partitionValues_parsed.part_col"),
             Scalar::from(part_val),
+        ),
+        (
+            column_name!("stats_parsed.minValues.data_col"),
+            Scalar::Null(DataType::INTEGER),
         ),
         (
             column_name!("stats_parsed.maxValues.data_col"),
@@ -876,6 +945,10 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
         (
             column_name!("stats_parsed.nullCount.data_col"),
             Scalar::from(0i64),
+        ),
+        (
+            column_name!("stats_parsed.minValues.data_col"),
+            Scalar::Null(DataType::INTEGER),
         ),
         (
             column_name!("stats_parsed.maxValues.data_col"),
@@ -1361,4 +1434,76 @@ fn timestamp_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
 )]
 fn unsupported_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
     assert_eq!(count_selected(STATS_TABLE, Arc::new(pred)), expected);
+}
+
+// -- Inverted stats (hand-written log) ----------------------------------------
+// One `long` column k, three adds: `inverted` declares min 9 / max 1, `valid` [10, 12],
+// `min_only` min 30 and no max. Data files are never read.
+
+fn inverted_stats_table() -> tempfile::TempDir {
+    use serde_json::json;
+    let add = |path: &str, stats: serde_json::Value| {
+        json!({"add": {
+            "path": path,
+            "partitionValues": {},
+            "size": 1,
+            "modificationTime": 0,
+            "dataChange": true,
+            "stats": stats.to_string(),
+        }})
+    };
+    let schema = json!({"type": "struct", "fields": [
+        {"name": "k", "type": "long", "nullable": true, "metadata": {}},
+    ]});
+    let actions = [
+        json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+        json!({"metaData": {
+            "id": "inverted-stats",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema.to_string(),
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 0,
+        }}),
+        add(
+            "inverted.parquet",
+            json!({
+                "numRecords": 5,
+                "minValues": {"k": 9},
+                "maxValues": {"k": 1},
+                "nullCount": {"k": 0},
+            }),
+        ),
+        add(
+            "valid.parquet",
+            json!({
+                "numRecords": 3,
+                "minValues": {"k": 10},
+                "maxValues": {"k": 12},
+                "nullCount": {"k": 0},
+            }),
+        ),
+        add(
+            "min_only.parquet",
+            json!({"numRecords": 3, "minValues": {"k": 30}, "nullCount": {"k": 0}}),
+        ),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("_delta_log");
+    std::fs::create_dir(&log_dir).unwrap();
+    let commit: String = actions.iter().map(|a| format!("{a}\n")).collect();
+    std::fs::write(log_dir.join("00000000000000000000.json"), commit).unwrap();
+    dir
+}
+
+#[rstest]
+#[case::eq_in_inverted(Pred::eq(column_expr!("k"), Expr::literal(1i64)), 1)]
+#[case::eq_in_valid(Pred::eq(column_expr!("k"), Expr::literal(11i64)), 2)]
+#[case::eq_above_min_only(Pred::eq(column_expr!("k"), Expr::literal(35i64)), 2)]
+#[case::lt_below_valid(Pred::lt(column_expr!("k"), Expr::literal(5i64)), 1)]
+#[case::eq_above_all(Pred::eq(column_expr!("k"), Expr::literal(100i64)), 2)]
+fn inverted_stats_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    let table = inverted_stats_table();
+    let path = table.path().to_str().unwrap();
+    assert_eq!(count_selected(path, Arc::new(pred)), expected);
 }
