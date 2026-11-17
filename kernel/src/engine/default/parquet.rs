@@ -264,7 +264,7 @@ async fn read_parquet_files_impl(
             1024,
             physical_schema.clone(),
             predicate,
-        ));
+        )?);
         let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
             |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
         );
@@ -383,15 +383,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         self.task_executor.block_on(async move {
             let metadata = if location.is_presigned() {
-                let client = reqwest::Client::new();
-                let response =
-                    client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
-                    })?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
+                let bytes =
+                    super::fetch_presigned_url(&super::presigned_url_client()?, location.as_str())
+                        .await?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
@@ -503,14 +497,14 @@ impl PresignedUrlOpener {
         batch_size: usize,
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Self {
-        Self {
+    ) -> DeltaResult<Self> {
+        Ok(Self {
             batch_size,
             table_schema: schema,
             predicate,
             limit: None,
-            client: reqwest::Client::new(),
-        }
+            client: super::presigned_url_client()?,
+        })
     }
 }
 
@@ -525,7 +519,7 @@ impl FileOpener for PresignedUrlOpener {
 
         Ok(Box::pin(async move {
             // fetch the file from the interweb
-            let reader = client.get(&file_location).send().await?.bytes().await?;
+            let reader = super::fetch_presigned_url(&client, &file_location).await?;
             let reader_options = reader_options();
             let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
             let parquet_schema = metadata.schema();

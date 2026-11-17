@@ -330,6 +330,26 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 }
 
+pub(crate) fn presigned_url_client() -> DeltaResult<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+pub(crate) async fn fetch_presigned_url(
+    client: &reqwest::Client,
+    url: &str,
+) -> DeltaResult<bytes::Bytes> {
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(crate::Error::generic(format!(
+            "Failed to fetch presigned URL: HTTP status {status}"
+        )));
+    }
+    Ok(response.bytes().await?)
+}
+
 trait UrlExt {
     // Check if a given url is a presigned url and can be used
     // to access the object store via simple http requests
