@@ -207,8 +207,7 @@ async fn read_files_impl(
                 Path::from(url.path())
             };
             if url.is_presigned() {
-                // have to annotate type here or rustc can't figure it out
-                Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                super::fetch_presigned_url(&super::presigned_url_client()?, url.as_str()).await
             } else if let Some(rng) = range {
                 Ok(store.get_range(&path, rng).await?)
             } else {
