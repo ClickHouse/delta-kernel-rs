@@ -11,6 +11,7 @@ pub use self::column_names::{
     column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
     ColumnName,
 };
+pub use self::retained_size::RetainedHeapSize;
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -22,6 +23,7 @@ use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
+mod retained_size;
 pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 

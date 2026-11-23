@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{DvInfo, ScanFile};
@@ -479,6 +480,19 @@ pub struct SharedDvInfo;
 pub unsafe extern "C" fn dv_info_has_vector(dv_info: Handle<SharedDvInfo>) -> bool {
     let dv_info = unsafe { dv_info.as_ref() };
     dv_info.has_vector
+}
+
+/// Get the number of bytes of memory kept alive by a [`SharedDvInfo`] handle, including the
+/// reference-counted allocation that holds it. An engine that keeps the handle in a cache uses it
+/// to bound the memory of the cache: an inline deletion vector can be large.
+///
+/// # Safety
+/// Engine is responsible for passing a valid `SharedDvInfo` handle.
+#[no_mangle]
+pub unsafe extern "C" fn dv_info_retained_size(dv_info: Handle<SharedDvInfo>) -> usize {
+    let dv_info = unsafe { dv_info.as_ref() };
+    (2 * size_of::<usize>() + size_of::<CDvInfo>())
+        .saturating_add(dv_info.info.retained_heap_size())
 }
 
 /// This callback will be invoked for each valid file that needs to be read for a scan.

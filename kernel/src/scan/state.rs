@@ -48,6 +48,14 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
+    /// Returns the number of heap bytes owned by this `DvInfo`: the path of the deletion vector
+    /// file, or the encoded deletion vector itself when it is stored inline in the log.
+    pub fn retained_heap_size(&self) -> usize {
+        self.deletion_vector
+            .as_ref()
+            .map_or(0, |descriptor| descriptor.path_or_inline_dv.capacity())
+    }
+
     pub(crate) fn get_treemap(
         &self,
         engine: &dyn Engine,

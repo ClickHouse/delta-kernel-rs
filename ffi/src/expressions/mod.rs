@@ -1,8 +1,9 @@
 //! This module holds functionality for moving expressions across the FFI boundary, both from
 //! engine to kernel, and from kernel to engine.
 use std::ffi::c_void;
+use std::mem::size_of;
 
-use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp};
+use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp, RetainedHeapSize};
 use delta_kernel::{Expression, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -31,6 +32,20 @@ pub struct SharedOpaqueExpressionOp;
 #[no_mangle]
 pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) {
     data.drop_handle();
+}
+
+/// Get the number of bytes of memory kept alive by a [`SharedExpression`] handle, including the
+/// reference-counted allocation that holds the expression. An engine that keeps the handle in a
+/// cache, such as the transform of a scan file with its partition values, uses it to bound the
+/// memory of the cache.
+///
+/// # Safety
+/// Engine is responsible for passing a valid `SharedExpression` handle.
+#[no_mangle]
+pub unsafe extern "C" fn expression_retained_size(expression: Handle<SharedExpression>) -> usize {
+    let expression = unsafe { expression.as_ref() };
+    (2 * size_of::<usize>() + size_of::<Expression>())
+        .saturating_add(expression.retained_heap_size())
 }
 
 /// Free the memory the passed SharedPredicate
