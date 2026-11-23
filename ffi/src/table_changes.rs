@@ -20,8 +20,7 @@ use crate::panic::catch_panic_into_result;
 use crate::scan::EnginePredicate;
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
-    SharedSchema,
+    ExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSchema,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -381,7 +380,7 @@ type CCdfScanFileCallback = extern "C" fn(
     path: KernelStringSlice,
     size: i64,
     is_cdc: bool,
-    transform: OptionalValue<Handle<SharedExpression>>,
+    transform: *mut SharedExpression,
     row_indexes: *const u64,
     row_indexes_len: usize,
     row_indexes_are_selection: bool,
@@ -456,8 +455,7 @@ fn table_changes_scan_files_next_impl(
     };
     let path = file.path.as_str();
     let row_indexes = file.row_indexes.as_deref().unwrap_or_default();
-    let transform: OptionalValue<Handle<SharedExpression>> =
-        file.transform.clone().map(Into::into).into();
+    let transform = Handle::into_raw_or_null(file.transform.clone().map(Into::into));
     callback(
         engine_context,
         kernel_string_slice!(path),
@@ -717,7 +715,7 @@ mod tests {
 
         let table_root_str =
             unsafe { table_changes_table_root(table_changes.shallow_copy(), allocate_str) };
-        assert_eq!(recover_string(table_root_str.unwrap()), table_root);
+        assert_eq!(recover_string(table_root_str), table_root);
 
         let schema = unsafe { table_changes_schema(table_changes.shallow_copy()).shallow_copy() };
         let schema_ref = unsafe { schema.as_ref() };
@@ -739,7 +737,7 @@ mod tests {
         let scan_table_root = unsafe {
             table_changes_scan_table_root(table_changes_scan.shallow_copy(), allocate_str)
         };
-        assert_eq!(recover_string(scan_table_root.unwrap()), table_root);
+        assert_eq!(recover_string(scan_table_root), table_root);
 
         let logical_schema = unsafe {
             table_changes_scan_logical_schema(table_changes_scan.shallow_copy()).shallow_copy()

@@ -914,8 +914,8 @@ mod tests {
 
             // Ensure the ffi returns the correct table path
             let write_path = unsafe { get_write_path(write_context.shallow_copy(), allocate_str) };
-            assert!(write_path.is_some());
-            let unwrapped_url = recover_string(write_path.unwrap());
+            assert!(!write_path.is_null());
+            let unwrapped_url = recover_string(write_path);
             let parsed_unwrapped_url = Url::parse(&unwrapped_url)?;
             assert_eq!(
                 std::fs::canonicalize(parsed_unwrapped_url.to_file_path().unwrap())?,
@@ -1277,13 +1277,13 @@ mod tests {
         use crate::delta_kernel_unity_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
         };
-        use crate::{Handle, NullableCvoid, OptionalValue};
+        use crate::{NullableCvoid, OptionalValue};
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
             context: NullableCvoid,
             request: CommitRequest,
-        ) -> OptionalValue<Handle<crate::ExclusiveRustString>> {
+        ) -> *mut crate::ExclusiveRustString {
             let context = cast_test_context(context).unwrap();
             context.commit_called = true;
 
@@ -1298,7 +1298,7 @@ mod tests {
                 context.last_staged_filename = Some(file_name);
             }
 
-            OptionalValue::None
+            std::ptr::null_mut()
         }
 
         let schema = Arc::new(StructType::new_unchecked(vec![

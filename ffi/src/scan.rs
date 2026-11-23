@@ -523,9 +523,9 @@ type CScanCallback = extern "C" fn(
     path: KernelStringSlice,
     size: i64,
     mod_time: i64,
-    stats: Option<&Stats>,
+    stats: *const Stats,
     dv_info: Handle<SharedDvInfo>,
-    transform: OptionalValue<Handle<SharedExpression>>,
+    transform: *mut SharedExpression,
     partition_map: &CStringMap,
 ) -> bool;
 
@@ -569,7 +569,9 @@ fn get_from_string_map_impl(
     Ok(map
         .values
         .get(string_key)
-        .and_then(|v| allocate_fn(kernel_string_slice!(v))))
+        .map_or(std::ptr::null_mut(), |v| {
+            allocate_fn(kernel_string_slice!(v))
+        }))
 }
 
 /// Visit all values in a CStringMap. The callback will be called once for each element of the map
@@ -724,9 +726,9 @@ fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) -> bool {
         kernel_string_slice!(path),
         scan_file.size,
         scan_file.modification_time,
-        stats.as_ref(),
+        stats.as_ref().map_or(std::ptr::null(), |stats| stats),
         dv_info_handle,
-        transform.into(),
+        Handle::into_raw_or_null(transform),
         &partition_map,
     )
 }
@@ -1409,7 +1411,6 @@ mod scan_metadata_arrow_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::ptr::NonNull;
 
     use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
@@ -1418,7 +1419,7 @@ mod tests {
         key: KernelStringSlice,
         value: KernelStringSlice,
     ) {
-        let map_ptr: *mut HashMap<String, String> = engine_context.unwrap().as_ptr().cast();
+        let map_ptr: *mut HashMap<String, String> = engine_context.cast();
         let key = unsafe { String::try_from_slice(&key).unwrap() };
         let value = unsafe { String::try_from_slice(&value).unwrap() };
         unsafe {
@@ -1438,8 +1439,7 @@ mod tests {
         let context_map: Box<HashMap<String, String>> = Box::default();
         let map_ptr: *mut HashMap<String, String> = Box::into_raw(context_map);
         unsafe {
-            let ptr = NonNull::new_unchecked(map_ptr.cast());
-            super::visit_string_map(&cmap, Some(ptr), visit_entry);
+            super::visit_string_map(&cmap, map_ptr.cast(), visit_entry);
         }
         let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
         assert_eq!(test_map, final_map);

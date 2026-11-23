@@ -65,7 +65,7 @@ mod ffi_test_utils;
 pub mod test_ffi;
 pub mod transaction;
 
-pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
+pub(crate) type NullableCvoid = *mut c_void;
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
@@ -77,7 +77,7 @@ pub struct EngineIterator {
     /// A function that should advance the iterator and return the next time from the data
     /// If the iterator is complete, it should return null. It should be safe to
     /// call `get_next()` multiple times if it returns null.
-    get_next: extern "C" fn(data: NonNull<c_void>) -> *const c_void,
+    get_next: extern "C" fn(data: *mut c_void) -> *const c_void,
 }
 
 impl Iterator for EngineIterator {
@@ -85,7 +85,7 @@ impl Iterator for EngineIterator {
     type Item = *const c_void;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_item = (self.get_next)(self.data);
+        let next_item = (self.get_next)(self.data.as_ptr());
         if next_item.is_null() {
             None
         } else {
@@ -1298,8 +1298,8 @@ pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
 ///
 /// The visitor receives:
 /// - `id`: always present
-/// - `name`: `OptionalValue::None` if not set
-/// - `description`: `OptionalValue::None` if not set
+/// - `name`: null if not set
+/// - `description`: null if not set
 /// - `format_provider`: always present
 /// - `has_created_time`: whether `created_time_ms` is meaningful
 /// - `created_time_ms`: milliseconds since epoch (only valid when `has_created_time` is true)
@@ -1315,8 +1315,8 @@ pub unsafe extern "C" fn visit_metadata(
     visit_metadata_fields: extern "C" fn(
         context: NullableCvoid,
         id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
+        name: *const KernelStringSlice,
+        description: *const KernelStringSlice,
         format_provider: KernelStringSlice,
         has_created_time: bool,
         created_time_ms: i64,
@@ -1325,11 +1325,8 @@ pub unsafe extern "C" fn visit_metadata(
     let metadata = unsafe { metadata.as_ref() };
     let id_str = metadata.id();
     let id = kernel_string_slice!(id_str);
-    let name = metadata.name().map(|s| kernel_string_slice!(s)).into();
-    let description = metadata
-        .description()
-        .map(|s| kernel_string_slice!(s))
-        .into();
+    let name = metadata.name().map(|s| kernel_string_slice!(s));
+    let description = metadata.description().map(|s| kernel_string_slice!(s));
     let fp_str = metadata.format_provider();
     let format_provider = kernel_string_slice!(fp_str);
     let (has_created_time, created_time_ms) = match metadata.created_time() {
@@ -1339,8 +1336,10 @@ pub unsafe extern "C" fn visit_metadata(
     visit_metadata_fields(
         context,
         id,
-        name,
-        description,
+        name.as_ref().map_or(std::ptr::null(), |name| name),
+        description
+            .as_ref()
+            .map_or(std::ptr::null(), |description| description),
         format_provider,
         has_created_time,
         created_time_ms,
@@ -1619,8 +1618,8 @@ mod tests {
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
-        assert!(snapshot_table_root_str.is_some());
-        let s = recover_string(snapshot_table_root_str.unwrap());
+        assert!(!snapshot_table_root_str.is_null());
+        let s = recover_string(snapshot_table_root_str);
         assert_eq!(&s, table_root);
 
         unsafe { free_snapshot(snapshot1) }
@@ -1745,15 +1744,14 @@ mod tests {
             key: KernelStringSlice,
             value: KernelStringSlice,
         ) {
-            let map =
-                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
+            let map = unsafe { &mut *(engine_context as *mut HashMap<String, String>) };
             let k = unsafe { String::try_from_slice(&key) }.unwrap();
             let v = unsafe { String::try_from_slice(&value) }.unwrap();
             map.insert(k, v);
         }
 
         let mut collected: HashMap<String, String> = HashMap::new();
-        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
+        let ctx = &mut collected as *mut _ as *mut c_void;
         unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
 
         assert_eq!(collected, expected);
@@ -1947,7 +1945,13 @@ mod tests {
             let s = unsafe { String::try_from_slice(&slice) }.unwrap();
             assert_eq!(s.as_str(), "val", "Partition col should be 'val'");
         }
-        while unsafe { string_slice_next(partition_iter.shallow_copy(), None, visit_partition) } {
+        while unsafe {
+            string_slice_next(
+                partition_iter.shallow_copy(),
+                std::ptr::null_mut(),
+                visit_partition,
+            )
+        } {
             // validate happens inside visit_partition
         }
 
@@ -2323,7 +2327,7 @@ mod tests {
     }
 
     extern "C" fn protocol_version_cb(ctx: NullableCvoid, min_reader: i32, min_writer: i32) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut ProtocolVisitState) };
+        let state = unsafe { &mut *(ctx as *mut ProtocolVisitState) };
         state.min_reader = min_reader;
         state.min_writer = min_writer;
     }
@@ -2333,7 +2337,7 @@ mod tests {
         is_reader: bool,
         feature: KernelStringSlice,
     ) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut ProtocolVisitState) };
+        let state = unsafe { &mut *(ctx as *mut ProtocolVisitState) };
         let name = unsafe { String::try_from_slice(&feature) }.unwrap();
         if is_reader {
             state.reader_features.push(name);
@@ -2346,7 +2350,7 @@ mod tests {
     fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
         let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
         let mut state = ProtocolVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        let ctx = &mut state as *mut ProtocolVisitState as *mut c_void;
         unsafe {
             visit_protocol(
                 proto.shallow_copy(),
@@ -2389,22 +2393,18 @@ mod tests {
     extern "C" fn metadata_visit_cb(
         ctx: NullableCvoid,
         id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
+        name: *const KernelStringSlice,
+        description: *const KernelStringSlice,
         format_provider: KernelStringSlice,
         has_created_time: bool,
         created_time_ms: i64,
     ) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut MetadataVisitState) };
+        let state = unsafe { &mut *(ctx as *mut MetadataVisitState) };
         state.id = Some(slice_to_string(id));
-        state.name = match name {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.description = match description {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
+        state.name =
+            unsafe { name.as_ref() }.map(|s| unsafe { String::try_from_slice(s) }.unwrap());
+        state.description =
+            unsafe { description.as_ref() }.map(|s| unsafe { String::try_from_slice(s) }.unwrap());
         state.format_provider = Some(slice_to_string(format_provider));
         state.has_created_time = has_created_time;
         state.created_time_ms = created_time_ms;
@@ -2414,7 +2414,7 @@ mod tests {
     fn collect_metadata_state(snap: &handle::Handle<SharedSnapshot>) -> MetadataVisitState {
         let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
         let mut state = MetadataVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
+        let ctx = &mut state as *mut MetadataVisitState as *mut c_void;
         unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
         unsafe { free_metadata(meta) };
         state

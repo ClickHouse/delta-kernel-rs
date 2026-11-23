@@ -60,7 +60,7 @@ void validate_and_clean_staging_file(char* table_uri, char* file_name, Commit *c
 }
 
 // our implementation of `commit`
-OptionalValueHandleExclusiveRustString commit_callback(
+ExclusiveRustString* commit_callback(
     NullableCvoid context_ptr,
     CommitRequest request)
 {
@@ -103,10 +103,8 @@ OptionalValueHandleExclusiveRustString commit_callback(
                request.latest_backfilled_version.some);
     }
 
-    // Return None to indicate success
-    OptionalValueHandleExclusiveRustString result;
-    result.tag = NoneHandleExclusiveRustString;
-    return result;
+    // Return NULL to indicate success
+    return NULL;
 }
 
 int main(int argc, char* argv[])
