@@ -4,8 +4,8 @@ use quote::{quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Error, Fields, FieldsNamed, FieldsUnnamed, Ident, ItemStruct, LitBool,
-    Result, Token, Type,
+    parse_macro_input, parse_quote, Error, Fields, FieldsNamed, FieldsUnnamed, Ident, ItemStruct,
+    LitBool, Result, Token, Type,
 };
 
 struct HandleDescriptorParams {
@@ -121,6 +121,8 @@ pub fn handle_descriptor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let new_struct = new_struct.into();
     let new_struct = parse_macro_input!(new_struct as ItemStruct);
     st.fields = new_struct.fields;
+    // `repr(C)` makes rustc's CFI type id the bare struct name, as in the C/C++ header.
+    st.attrs.push(parse_quote!(#[repr(C)]));
 
     // Emit the modified struct and also derive the impl HandleDescriptor for it.
     let mutable = bool_to_boolean(descriptor_params.mutable);

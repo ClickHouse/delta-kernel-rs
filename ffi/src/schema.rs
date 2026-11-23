@@ -48,7 +48,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
         child_list_id: usize,
     ),
 
@@ -59,7 +59,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
         child_list_id: usize,
     ),
 
@@ -71,7 +71,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
         child_list_id: usize,
     ),
 
@@ -81,7 +81,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
         precision: u8,
         scale: u8,
     ),
@@ -92,7 +92,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `long` belonging to the list identified by `sibling_list_id`.
@@ -101,7 +101,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit an `integer` belonging to the list identified by `sibling_list_id`.
@@ -110,7 +110,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `short` belonging to the list identified by `sibling_list_id`.
@@ -119,7 +119,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `byte` belonging to the list identified by `sibling_list_id`.
@@ -128,7 +128,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `float` belonging to the list identified by `sibling_list_id`.
@@ -137,7 +137,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `double` belonging to the list identified by `sibling_list_id`.
@@ -146,7 +146,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `boolean` belonging to the list identified by `sibling_list_id`.
@@ -155,7 +155,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit `binary` belonging to the list identified by `sibling_list_id`.
@@ -164,7 +164,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `date` belonging to the list identified by `sibling_list_id`.
@@ -173,7 +173,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `timestamp` belonging to the list identified by `sibling_list_id`.
@@ -182,7 +182,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
@@ -191,7 +191,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 
     /// Visit a `variant` belonging to the list identified by `sibling_list_id`.
@@ -200,7 +200,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
     ),
 }
 
@@ -287,7 +287,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         name: &str,
         data_type: &DataType,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: *const CStringMap,
         visitor: &EngineSchemaVisitor,
         sibling_list_id: usize,
     ) {

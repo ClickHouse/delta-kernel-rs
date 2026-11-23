@@ -12,7 +12,6 @@ pragma_once = true
 only_target_dependencies = true
 
 # only applies to Cxx
-namespace = "ffi"
 cpp_compat = true
 
 [defines]

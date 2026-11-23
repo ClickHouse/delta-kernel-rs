@@ -1,7 +1,5 @@
 //! Utility functions used for tests in this crate.
 
-use std::os::raw::c_void;
-use std::ptr::NonNull;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -42,9 +40,7 @@ pub(crate) extern "C" fn allocate_err(
 #[no_mangle]
 pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
     let s = unsafe { String::try_from_slice(&kernel_str) };
-    let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
-    let ptr = unsafe { NonNull::new_unchecked(ptr) };
-    Some(ptr)
+    Box::into_raw(Box::new(s.unwrap())).cast() // never null
 }
 
 /// Recover an error from 'allocate_err'
@@ -53,8 +49,8 @@ pub(crate) unsafe fn recover_error(ptr: *mut EngineError) -> EngineErrorWithMess
 }
 
 /// Recover a string from `allocate_str`
-pub(crate) fn recover_string(ptr: NonNull<c_void>) -> String {
-    let ptr = ptr.as_ptr().cast();
+pub(crate) fn recover_string(ptr: NullableCvoid) -> String {
+    let ptr = ptr.cast();
     *unsafe { Box::from_raw(ptr) }
 }
 

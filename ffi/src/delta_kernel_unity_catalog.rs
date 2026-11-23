@@ -17,7 +17,8 @@ use unity_catalog_delta_client_api::{
     CommitClient, CommitRequest as ClientCommitRequest, Result as ApiResult,
 };
 
-use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
+use crate::error::{AllocateErrorFn, ExternResult};
+use crate::panic::catch_panic_into_result;
 use crate::transaction::MutableCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
@@ -45,14 +46,12 @@ pub struct CommitRequest {
     pub protocol: OptionalValue<KernelStringSlice>,
 }
 
-/// The callback that will be called when the client wants to commit. Return `None` on success, or
-/// `Some("error description")` if an error occured.
+/// The callback that will be called when the client wants to commit. Return null on success, or
+/// an `ExclusiveRustString` handle with the error description if an error occured.
 // Note, it doesn't make sense to return an ExternResult here because that can't hold the string
 // error msg
-pub type CCommit = extern "C" fn(
-    context: NullableCvoid,
-    request: CommitRequest,
-) -> OptionalValue<Handle<ExclusiveRustString>>;
+pub type CCommit =
+    extern "C" fn(context: NullableCvoid, request: CommitRequest) -> *mut ExclusiveRustString;
 
 pub struct FfiUCCommitClient {
     context: NullableCvoid,
@@ -87,13 +86,14 @@ impl CommitClient for FfiUCCommitClient {
                 protocol: None.into(),
             };
 
-            match (self.commit_callback)(self.context, c_commit_request) {
-                OptionalValue::Some(e) => {
+            let error = (self.commit_callback)(self.context, c_commit_request);
+            match unsafe { Handle::from_raw_or_null(error) } {
+                Some(e) => {
                     let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
                     let s: String = *boxed_str; // move back onto the stack
                     Err(unity_catalog_delta_client_api::Error::Generic(s))
                 }
-                OptionalValue::None => Ok(()),
+                None => Ok(()),
             }
         };
 
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn get_uc_committer(
     table_id: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    get_uc_committer_impl(commit_client, table_id).into_extern_result(&error_fn)
+    unsafe { catch_panic_into_result(&error_fn, || get_uc_committer_impl(commit_client, table_id)) }
 }
 
 fn get_uc_committer_impl(
@@ -239,7 +239,6 @@ pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitte
 #[cfg(test)]
 pub(crate) mod tests {
     use std::ffi::c_void;
-    use std::ptr::NonNull;
     use std::sync::Arc;
 
     use unity_catalog_delta_client_api::{Commit as ClientCommit, Error as ApiError};
@@ -262,25 +261,25 @@ pub(crate) mod tests {
             last_staged_filename: None,
             should_fail_commit,
         });
-        NonNull::new(Box::into_raw(context) as *mut c_void)
+        Box::into_raw(context) as *mut c_void
     }
 
     // take back ownership of the context. be aware that you therefore cannot call this twice with
     // the same context pointer
     pub(crate) fn recover_test_context(context: NullableCvoid) -> Option<Box<TestContext>> {
-        context.map(|context| unsafe { Box::from_raw(context.as_ptr() as *mut TestContext) })
+        (!context.is_null()).then(|| unsafe { Box::from_raw(context as *mut TestContext) })
     }
 
     // get the context without taking ownership
     pub(crate) fn cast_test_context<'a>(context: NullableCvoid) -> Option<&'a mut TestContext> {
-        context.map(|ptr| unsafe { &mut *(ptr.as_ptr() as *mut TestContext) })
+        (!context.is_null()).then(|| unsafe { &mut *(context as *mut TestContext) })
     }
 
     #[no_mangle]
     extern "C" fn test_commit_callback(
         context: NullableCvoid,
         request: CommitRequest,
-    ) -> OptionalValue<Handle<ExclusiveRustString>> {
+    ) -> *mut ExclusiveRustString {
         let context = cast_test_context(context).unwrap();
 
         context.commit_called = true;
@@ -303,15 +302,15 @@ pub(crate) mod tests {
                     allocate_err,
                 ))
             };
-            OptionalValue::Some(error_str)
+            Handle::into_raw_or_null(Some(error_str))
         } else {
-            OptionalValue::None
+            std::ptr::null_mut()
         }
     }
 
     #[test]
     fn test_get_uc_commit_client() {
-        let client = unsafe { get_uc_commit_client(None, test_commit_callback) };
+        let client = unsafe { get_uc_commit_client(std::ptr::null_mut(), test_commit_callback) };
 
         let _client_ref: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
         unsafe { free_uc_commit_client(client) };
@@ -400,7 +399,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_uc_committer() {
-        let client = unsafe { get_uc_commit_client(None, test_commit_callback) };
+        let client = unsafe { get_uc_commit_client(std::ptr::null_mut(), test_commit_callback) };
 
         let table_id = "test_table_id";
         let committer = unsafe {

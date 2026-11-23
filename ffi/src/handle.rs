@@ -98,7 +98,8 @@ mod private {
     /// cbindgen:transparent-typedef
     #[repr(transparent)]
     pub struct Handle<H: HandleDescriptor> {
-        ptr: NonNull<H>,
+        // Raw pointer: `NonNull` CFI type ids differ from C pointers (rust-lang/rust#166403).
+        ptr: *mut H,
     }
 
     /// # Safety
@@ -142,7 +143,7 @@ mod private {
         ///
         /// * No mutable references can overlap with the returned reference.
         pub unsafe fn as_ref(&self) -> &H::Target {
-            H::as_ref(self.ptr.cast().as_ptr())
+            H::as_ref(self.ptr.cast())
         }
 
         /// Consumes this handle and returns the resource it was originally created `From`: A
@@ -152,7 +153,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn into_inner(self) -> H::From {
-            H::into_inner(self.ptr.cast().as_ptr())
+            H::into_inner(self.ptr.cast())
         }
         /// Drops this handle. Dropping a mutable handle always drops the underlying object as well;
         /// dropping a shared handle only drops the underlying object if the handle was the last
@@ -171,6 +172,24 @@ mod private {
         #[cfg(test)]
         pub fn shallow_copy(&self) -> Self {
             Handle { ptr: self.ptr }
+        }
+    }
+
+    impl<H: HandleDescriptor> Handle<H> {
+        /// Converts an optional handle into a nullable pointer for a C callback. `None` becomes
+        /// null.
+        pub fn into_raw_or_null(handle: Option<Self>) -> *mut H {
+            handle.map_or(std::ptr::null_mut(), |handle| handle.ptr)
+        }
+
+        /// Converts a nullable pointer returned by a C callback into an optional handle. Null
+        /// becomes `None`.
+        ///
+        /// # Safety
+        ///
+        /// Caller asserts that `ptr` is null or a [valid][Handle#Validity] handle pointer.
+        pub unsafe fn from_raw_or_null(ptr: *mut H) -> Option<Self> {
+            (!ptr.is_null()).then_some(Handle { ptr })
         }
     }
 
@@ -196,7 +215,7 @@ mod private {
         ///   reference. In particular, this means the caller must ensure no other thread can access
         ///   this handle while the returned reference is still alive.
         pub unsafe fn as_mut(&mut self) -> &mut T {
-            H::as_mut(self.ptr.cast().as_ptr())
+            H::as_mut(self.ptr.cast())
         }
     }
 
@@ -227,7 +246,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn clone_as_arc(&self) -> Arc<T> {
-            H::clone_arc(self.ptr.cast().as_ptr())
+            H::clone_arc(self.ptr.cast())
         }
     }
 
@@ -241,7 +260,7 @@ mod private {
             + MutableHandleOps<T, S, From = Box<T>>,
     {
         fn from(val: Box<T>) -> Handle<H> {
-            let ptr = H::into_handle_ptr(val).cast();
+            let ptr = H::into_handle_ptr(val).cast().as_ptr();
             Handle { ptr }
         }
     }
@@ -253,7 +272,7 @@ mod private {
             + SharedHandleOps<T, S, From = Arc<T>>,
     {
         fn from(val: Arc<T>) -> Handle<H> {
-            let ptr = H::into_handle_ptr(val).cast();
+            let ptr = H::into_handle_ptr(val).cast().as_ptr();
             Handle { ptr }
         }
     }

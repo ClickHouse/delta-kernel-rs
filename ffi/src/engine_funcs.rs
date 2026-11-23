@@ -12,9 +12,10 @@ use tracing::debug;
 use url::Url;
 
 use super::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
-    ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, TryFromStringSlice,
+    ExclusiveEngineData, ExternEngine, ExternResult, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSchema, TryFromStringSlice,
 };
 
 #[repr(C)]
@@ -65,9 +66,13 @@ pub unsafe extern "C" fn read_result_next(
         engine_data: Handle<ExclusiveEngineData>,
     ),
 ) -> ExternResult<bool> {
-    let iter = unsafe { data.as_mut() };
-    read_result_next_impl(iter, engine_context, engine_visitor)
-        .into_extern_result(iter.engine.error_allocator())
+    let panic_engine = unsafe { data.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let iter = data.as_mut();
+            read_result_next_impl(iter, engine_context, engine_visitor)
+        })
+    }
 }
 
 fn read_result_next_impl(
@@ -106,11 +111,14 @@ pub unsafe extern "C" fn read_parquet_file(
     file: &FileMeta,
     physical_schema: Handle<SharedSchema>,
 ) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
-    let engine = unsafe { engine.clone_as_arc() };
-    let physical_schema = unsafe { physical_schema.clone_as_arc() };
-    let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) };
-    let res = read_parquet_file_impl(engine.clone(), path, file, physical_schema);
-    res.into_extern_result(&engine.as_ref())
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.clone_as_arc();
+            let physical_schema = physical_schema.clone_as_arc();
+            let path = TryFromStringSlice::try_from_slice(&file.path);
+            read_parquet_file_impl(engine.clone(), path, file, physical_schema)
+        })
+    }
 }
 
 fn read_parquet_file_impl(
@@ -156,12 +164,15 @@ pub unsafe extern "C" fn new_expression_evaluator(
     // TODO: Make this a data_type, and give a way for c code to go between schema <-> datatype
     output_type: Handle<SharedSchema>,
 ) -> ExternResult<Handle<SharedExpressionEvaluator>> {
-    let engine = unsafe { engine.clone_as_arc() };
-    let input_schema = unsafe { input_schema.clone_as_arc() };
-    let output_type: DataType = output_type.as_ref().clone().into();
-    let expression = Arc::new(expression.clone());
-    let res = new_expression_evaluator_impl(engine.clone(), input_schema, expression, output_type);
-    res.into_extern_result(&engine.as_ref())
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.clone_as_arc();
+            let input_schema = input_schema.clone_as_arc();
+            let output_type: DataType = output_type.as_ref().clone().into();
+            let expression = Arc::new(expression.clone());
+            new_expression_evaluator_impl(engine.clone(), input_schema, expression, output_type)
+        })
+    }
 }
 
 fn new_expression_evaluator_impl(
@@ -199,11 +210,13 @@ pub unsafe extern "C" fn evaluate_expression(
     batch: &mut Handle<ExclusiveEngineData>,
     evaluator: Handle<SharedExpressionEvaluator>,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    let engine = unsafe { engine.clone_as_arc() };
-    let batch = unsafe { batch.as_mut() };
-    let evaluator = unsafe { evaluator.clone_as_arc() };
-    let res = evaluate_expression_impl(batch, evaluator.as_ref());
-    res.into_extern_result(&engine.as_ref())
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let batch = batch.as_mut();
+            let evaluator = evaluator.clone_as_arc();
+            evaluate_expression_impl(batch, evaluator.as_ref())
+        })
+    }
 }
 
 fn evaluate_expression_impl(

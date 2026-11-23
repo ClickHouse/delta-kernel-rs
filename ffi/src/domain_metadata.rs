@@ -1,8 +1,9 @@
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::DeltaResult;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice,
@@ -21,11 +22,15 @@ pub unsafe extern "C" fn get_domain_metadata(
     engine: Handle<SharedExternEngine>,
     allocate_fn: AllocateStringFn,
 ) -> ExternResult<NullableCvoid> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let domain = unsafe { String::try_from_slice(&domain) };
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.as_ref();
+            let engine = engine.as_ref();
+            let domain = String::try_from_slice(&domain);
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+            get_domain_metadata_impl(snapshot, domain, engine, allocate_fn)
+        })
+    }
 }
 
 fn get_domain_metadata_impl(
@@ -36,7 +41,9 @@ fn get_domain_metadata_impl(
 ) -> DeltaResult<NullableCvoid> {
     Ok(snapshot
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
-        .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
+        .map_or(std::ptr::null_mut(), |config: String| {
+            allocate_fn(kernel_string_slice!(config))
+        }))
 }
 
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
@@ -56,11 +63,14 @@ pub unsafe extern "C" fn visit_domain_metadata(
         configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.as_ref();
+            let engine = engine.as_ref();
 
-    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
-        .into_extern_result(&engine)
+            visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
+        })
+    }
 }
 
 fn visit_domain_metadata_impl(
@@ -90,7 +100,6 @@ fn visit_domain_metadata_impl(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::ptr::NonNull;
     use std::sync::Arc;
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -207,11 +216,11 @@ mod tests {
 
         let domain1 = "domain1";
         let res = ok_or_panic(get_domain_metadata_helper(domain1));
-        assert!(res.is_none());
+        assert!(res.is_null());
 
         let domain2 = "domain2";
         let res = ok_or_panic(get_domain_metadata_helper(domain2));
-        assert_eq!(recover_string(res.unwrap()), "domain2_commit1");
+        assert_eq!(recover_string(res), "domain2_commit1");
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
@@ -229,11 +238,8 @@ mod tests {
             key: KernelStringSlice,
             value: KernelStringSlice,
         ) {
-            let mut collected_metadata = unsafe {
-                Box::from_raw(
-                    state.unwrap().as_ptr() as *mut std::collections::HashMap<String, String>
-                )
-            };
+            let mut collected_metadata =
+                unsafe { Box::from_raw(state as *mut std::collections::HashMap<String, String>) };
             let key: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
             let value: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
             collected_metadata.insert(key.unwrap(), value.unwrap());
@@ -245,7 +251,7 @@ mod tests {
             ok_or_panic(visit_domain_metadata(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
-                Some(NonNull::new_unchecked(visitor_state_ptr).cast()),
+                visitor_state_ptr.cast(),
                 visitor,
             ))
         };
