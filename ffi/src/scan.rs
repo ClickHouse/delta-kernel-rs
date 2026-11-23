@@ -50,7 +50,7 @@ pub struct ExclusiveScanBuilder;
 pub struct EnginePredicate {
     pub predicate: *mut c_void,
     pub visitor:
-        extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+        extern "C" fn(predicate: *mut c_void, state: *mut KernelExpressionVisitorState) -> usize,
 }
 
 /// An engine-provided schema along with a visitor function to convert it to a kernel schema.
@@ -66,7 +66,7 @@ pub struct EnginePredicate {
 #[repr(C)]
 pub struct EngineSchema {
     pub schema: *mut c_void,
-    pub visitor: extern "C" fn(schema: *mut c_void, state: &mut KernelSchemaVisitorState) -> usize,
+    pub visitor: extern "C" fn(schema: *mut c_void, state: *mut KernelSchemaVisitorState) -> usize,
 }
 
 /// An engine-provided expression along with a visitor function to convert
@@ -81,7 +81,7 @@ pub struct EngineSchema {
 pub struct EngineExpression {
     pub expression: *mut c_void,
     pub visitor:
-        extern "C" fn(expression: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+        extern "C" fn(expression: *mut c_void, state: *mut KernelExpressionVisitorState) -> usize,
 }
 
 /// Drop a `SharedScanMetadata`.
@@ -526,10 +526,12 @@ type CScanCallback = extern "C" fn(
     stats: *const Stats,
     dv_info: Handle<SharedDvInfo>,
     transform: *mut SharedExpression,
-    partition_map: &CStringMap,
+    partition_map: *const CStringMap,
 ) -> bool;
 
 #[derive(Default)]
+// `repr(C)` gives a CFI type id matching C. `cfg_attr` hides it from cbindgen to keep it opaque.
+#[cfg_attr(all(), repr(C))]
 pub struct CStringMap {
     values: HashMap<String, String>,
 }
@@ -905,8 +907,9 @@ mod scan_builder_tests {
     /// the standard test table schema.
     extern "C" fn visit_id_only_schema(
         _schema_ptr: *mut c_void,
-        state: &mut KernelSchemaVisitorState,
+        state: *mut KernelSchemaVisitorState,
     ) -> usize {
+        let state = unsafe { &mut *state };
         let id = "id";
         let id_field_id = unsafe {
             ok_or_panic(visit_field_integer(
@@ -933,8 +936,9 @@ mod scan_builder_tests {
     /// Predicate visitor that constructs `id < 10`.
     extern "C" fn visit_id_lt_10(
         _pred_ptr: *mut c_void,
-        state: &mut KernelExpressionVisitorState,
+        state: *mut KernelExpressionVisitorState,
     ) -> usize {
+        let state = unsafe { &mut *state };
         let id = "id";
         let col = unsafe {
             ok_or_panic(visit_expression_column(
@@ -1065,8 +1069,9 @@ mod scan_builder_tests {
     /// `extract_kernel_schema` requires a struct root, so this produces an error.
     extern "C" fn visit_invalid_schema_not_struct(
         _schema_ptr: *mut c_void,
-        state: &mut KernelSchemaVisitorState,
+        state: *mut KernelSchemaVisitorState,
     ) -> usize {
+        let state = unsafe { &mut *state };
         let bare_field = "bare_field";
         unsafe {
             ok_or_panic(visit_field_integer(

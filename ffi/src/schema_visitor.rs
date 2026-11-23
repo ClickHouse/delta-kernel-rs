@@ -31,6 +31,8 @@ use crate::panic::catch_panic_into_result;
 use crate::{AllocateErrorFn, ExternResult, KernelStringSlice, ReferenceSet, TryFromStringSlice};
 
 #[derive(Default)]
+// `repr(C)` gives a CFI type id matching C. `cfg_attr` hides it from cbindgen to keep it opaque.
+#[cfg_attr(all(), repr(C))]
 pub struct KernelSchemaVisitorState {
     elements: ReferenceSet<StructField>,
 }

@@ -24,6 +24,8 @@ pub(crate) enum ExpressionOrPredicate {
 }
 
 #[derive(Default)]
+// `repr(C)` gives a CFI type id matching C. `cfg_attr` hides it from cbindgen to keep it opaque.
+#[cfg_attr(all(), repr(C))]
 pub struct KernelExpressionVisitorState {
     inflight_ids: ReferenceSet<ExpressionOrPredicate>,
 }

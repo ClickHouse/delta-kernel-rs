@@ -1491,8 +1491,9 @@ mod tests {
     /// Only supports primitive fields (no nested structs/arrays/maps) -- sufficient for tests.
     extern "C" fn visit_test_schema(
         schema_ptr: *mut c_void,
-        state: &mut KernelSchemaVisitorState,
+        state: *mut KernelSchemaVisitorState,
     ) -> usize {
+        let state = unsafe { &mut *state };
         let fields = unsafe { &*(schema_ptr as *const Vec<StructField>) };
         let field_ids: Vec<usize> = fields
             .iter()
