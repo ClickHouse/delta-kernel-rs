@@ -1,8 +1,9 @@
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::DeltaResult;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice,
@@ -21,11 +22,15 @@ pub unsafe extern "C" fn get_domain_metadata(
     engine: Handle<SharedExternEngine>,
     allocate_fn: AllocateStringFn,
 ) -> ExternResult<NullableCvoid> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let domain = unsafe { String::try_from_slice(&domain) };
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.as_ref();
+            let engine = engine.as_ref();
+            let domain = String::try_from_slice(&domain);
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+            get_domain_metadata_impl(snapshot, domain, engine, allocate_fn)
+        })
+    }
 }
 
 fn get_domain_metadata_impl(
@@ -56,11 +61,14 @@ pub unsafe extern "C" fn visit_domain_metadata(
         configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.as_ref();
+            let engine = engine.as_ref();
 
-    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
-        .into_extern_result(&engine)
+            visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
+        })
+    }
 }
 
 fn visit_domain_metadata_impl(

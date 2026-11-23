@@ -17,7 +17,8 @@ use unity_catalog_delta_client_api::{
     CommitClient, CommitRequest as ClientCommitRequest, Result as ApiResult,
 };
 
-use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
+use crate::error::{AllocateErrorFn, ExternResult};
+use crate::panic::catch_panic_into_result;
 use crate::transaction::MutableCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
@@ -208,7 +209,7 @@ pub unsafe extern "C" fn get_uc_committer(
     table_id: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    get_uc_committer_impl(commit_client, table_id).into_extern_result(&error_fn)
+    unsafe { catch_panic_into_result(&error_fn, || get_uc_committer_impl(commit_client, table_id)) }
 }
 
 fn get_uc_committer_impl(

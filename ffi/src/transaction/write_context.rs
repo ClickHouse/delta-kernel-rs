@@ -4,9 +4,10 @@ use delta_kernel::transaction::WriteContext;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::{ExclusiveCreateTransaction, ExclusiveTransaction};
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::expressions::SharedExpression;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
     kernel_string_slice, AllocateStringFn, NullableCvoid, SharedExternEngine, SharedSchema,
 };
@@ -32,11 +33,13 @@ pub unsafe extern "C" fn get_unpartitioned_write_context(
     txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    txn.unpartitioned_write_context()
-        .map(|wc| Arc::new(wc).into())
-        .into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            txn.unpartitioned_write_context()
+                .map(|wc| Arc::new(wc).into())
+        })
+    }
 }
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
@@ -52,11 +55,13 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
     txn: Handle<ExclusiveCreateTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    txn.unpartitioned_write_context()
-        .map(|wc| Arc::new(wc).into())
-        .into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            txn.unpartitioned_write_context()
+                .map(|wc| Arc::new(wc).into())
+        })
+    }
 }
 
 #[no_mangle]

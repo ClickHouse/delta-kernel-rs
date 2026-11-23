@@ -17,12 +17,12 @@ use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
+use crate::panic::catch_panic_into_result;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
-    TryFromStringSlice,
+    ExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
+    OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
@@ -103,8 +103,12 @@ pub unsafe extern "C" fn selection_vector_from_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<KernelBoolSlice> {
-    let scan_metadata = unsafe { scan_metadata.as_ref() };
-    selection_vector_from_scan_metadata_impl(scan_metadata).into_extern_result(&engine.as_ref())
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let scan_metadata = scan_metadata.as_ref();
+            selection_vector_from_scan_metadata_impl(scan_metadata)
+        })
+    }
 }
 
 fn selection_vector_from_scan_metadata_impl(
@@ -135,8 +139,12 @@ pub unsafe extern "C" fn scan(
     predicate: Option<&mut EnginePredicate>,
     schema: Option<&EngineSchema>,
 ) -> ExternResult<Handle<SharedScan>> {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.clone_as_arc();
+            scan_impl(snapshot, predicate, schema)
+        })
+    }
 }
 
 /// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
@@ -225,9 +233,11 @@ pub unsafe extern "C" fn scan_builder_with_predicate(
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    apply_predicate(*builder, predicate)
-        .map(|b| Box::new(b).into())
-        .into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine, || {
+            apply_predicate(*builder, predicate).map(|b| Box::new(b).into())
+        })
+    }
 }
 
 /// Apply a column projection schema to an [`ExclusiveScanBuilder`].
@@ -249,7 +259,7 @@ pub unsafe extern "C" fn scan_builder_with_schema(
     schema: &EngineSchema,
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
-    scan_builder_with_schema_impl(builder, schema).into_extern_result(&engine)
+    unsafe { catch_panic_into_result(&engine, || scan_builder_with_schema_impl(builder, schema)) }
 }
 
 fn scan_builder_with_schema_impl(
@@ -277,10 +287,11 @@ pub unsafe extern "C" fn scan_builder_build(
 ) -> ExternResult<Handle<SharedScan>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    builder
-        .build()
-        .map(|scan| Arc::new(scan).into())
-        .into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine, || {
+            builder.build().map(|scan| Arc::new(scan).into())
+        })
+    }
 }
 
 /// Free an [`ExclusiveScanBuilder`] without building a scan.
@@ -371,9 +382,13 @@ pub unsafe extern "C" fn scan_metadata_iter_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
 ) -> ExternResult<Handle<SharedScanMetadataIterator>> {
-    let engine = unsafe { engine.clone_as_arc() };
-    let scan = unsafe { scan.as_ref() };
-    scan_metadata_iter_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.clone_as_arc();
+            let scan = scan.as_ref();
+            scan_metadata_iter_init_impl(&engine, scan)
+        })
+    }
 }
 
 fn scan_metadata_iter_init_impl(
@@ -409,9 +424,13 @@ pub unsafe extern "C" fn scan_metadata_next(
         scan_metadata: Handle<SharedScanMetadata>,
     ),
 ) -> ExternResult<bool> {
-    let data = unsafe { data.as_ref() };
-    scan_metadata_next_impl(data, engine_context, engine_visitor)
-        .into_extern_result(&data.engine.as_ref())
+    let panic_engine = unsafe { data.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let data = data.as_ref();
+            scan_metadata_next_impl(data, engine_context, engine_visitor)
+        })
+    }
 }
 fn scan_metadata_next_impl(
     data: &ScanMetadataIterator,
@@ -535,8 +554,11 @@ pub unsafe extern "C" fn get_from_string_map(
     allocate_fn: AllocateStringFn,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<NullableCvoid> {
-    let engine = unsafe { engine.as_ref() };
-    get_from_string_map_impl(map, key, allocate_fn).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            get_from_string_map_impl(map, key, allocate_fn)
+        })
+    }
 }
 fn get_from_string_map_impl(
     map: &CStringMap,
@@ -619,10 +641,14 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     engine: Handle<SharedExternEngine>,
     root_url: KernelStringSlice,
 ) -> ExternResult<KernelBoolSlice> {
-    let dv_info_ref = unsafe { dv_info.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    selection_vector_from_dv_impl(&dv_info_ref.info, engine, root_url).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let dv_info_ref = dv_info.as_ref();
+            let engine = engine.as_ref();
+            let root_url = unwrap_and_parse_path_as_url(root_url);
+            selection_vector_from_dv_impl(&dv_info_ref.info, engine, root_url)
+        })
+    }
 }
 
 fn selection_vector_from_dv_impl(
@@ -646,10 +672,14 @@ pub unsafe extern "C" fn row_indexes_from_dv(
     engine: Handle<SharedExternEngine>,
     root_url: KernelStringSlice,
 ) -> ExternResult<KernelRowIndexArray> {
-    let dv_info_ref = unsafe { dv_info.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    row_indexes_from_dv_impl(&dv_info_ref.info, engine, root_url).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let dv_info_ref = dv_info.as_ref();
+            let engine = engine.as_ref();
+            let root_url = unwrap_and_parse_path_as_url(root_url);
+            row_indexes_from_dv_impl(&dv_info_ref.info, engine, root_url)
+        })
+    }
 }
 
 fn row_indexes_from_dv_impl(
@@ -719,9 +749,12 @@ pub unsafe extern "C" fn visit_scan_metadata(
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) -> ExternResult<bool> {
-    let scan_metadata = unsafe { scan_metadata.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    visit_scan_metadata_impl(scan_metadata, engine_context, callback).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let scan_metadata = scan_metadata.as_ref();
+            visit_scan_metadata_impl(scan_metadata, engine_context, callback)
+        })
+    }
 }
 fn visit_scan_metadata_impl(
     scan_metadata: &ScanMetadata,
@@ -781,9 +814,12 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
     data: Handle<SharedScanMetadataIterator>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
-    let data = unsafe { data.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    scan_metadata_next_arrow_impl(data).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let data = data.as_ref();
+            scan_metadata_next_arrow_impl(data)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]

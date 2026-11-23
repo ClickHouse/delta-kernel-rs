@@ -5,10 +5,11 @@ use delta_kernel::{DeltaResult, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::transaction::ExclusiveTransaction;
 use crate::{
-    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
-    SharedSnapshot, TryFromStringSlice,
+    ExternEngine, KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot,
+    TryFromStringSlice,
 };
 
 /// Associates an app_id and version with a transaction. These will be applied to the table on
@@ -27,10 +28,13 @@ pub unsafe extern "C" fn with_transaction_id(
     version: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    let app_id_res: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    with_transaction_id_impl(*txn, app_id_res, version).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            let app_id_res: DeltaResult<String> = TryFromStringSlice::try_from_slice(&app_id);
+            with_transaction_id_impl(*txn, app_id_res, version)
+        })
+    }
 }
 
 fn with_transaction_id_impl(
@@ -55,13 +59,15 @@ pub unsafe extern "C" fn get_app_id_version(
     app_id: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<i64>> {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    let engine = unsafe { engine.as_ref() };
-    let app_id_res = unsafe { String::try_from_slice(&app_id) };
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.clone_as_arc();
+            let engine = engine.as_ref();
+            let app_id_res = String::try_from_slice(&app_id);
 
-    get_app_id_version_impl(snapshot, app_id_res, engine)
-        .map(OptionalValue::from)
-        .into_extern_result(&engine)
+            get_app_id_version_impl(snapshot, app_id_res, engine).map(OptionalValue::from)
+        })
+    }
 }
 
 fn get_app_id_version_impl(

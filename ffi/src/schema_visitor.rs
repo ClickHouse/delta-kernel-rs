@@ -27,10 +27,8 @@ use delta_kernel::schema::{
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
 
-use crate::{
-    AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
-    TryFromStringSlice,
-};
+use crate::panic::catch_panic_into_result;
+use crate::{AllocateErrorFn, ExternResult, KernelStringSlice, ReferenceSet, TryFromStringSlice};
 
 #[derive(Default)]
 pub struct KernelSchemaVisitorState {
@@ -105,9 +103,12 @@ pub unsafe extern "C" fn visit_field_string(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable)
+        })
+    }
 }
 
 /// Visit a long field. Long fields store 64-bit signed integers.
@@ -123,9 +124,12 @@ pub unsafe extern "C" fn visit_field_long(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable)
+        })
+    }
 }
 
 /// Visit an integer field. Integer fields store 32-bit signed integers.
@@ -141,9 +145,12 @@ pub unsafe extern "C" fn visit_field_integer(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable)
+        })
+    }
 }
 
 /// Visit a short field. Short fields store 16-bit signed integers.
@@ -159,9 +166,12 @@ pub unsafe extern "C" fn visit_field_short(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable)
+        })
+    }
 }
 
 /// Visit a byte field. Byte fields store 8-bit signed integers.
@@ -177,9 +187,12 @@ pub unsafe extern "C" fn visit_field_byte(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable)
+        })
+    }
 }
 
 /// Visit a float field. Float fields store 32-bit floating point numbers.
@@ -195,9 +208,12 @@ pub unsafe extern "C" fn visit_field_float(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable)
+        })
+    }
 }
 
 /// Visit a double field. Double fields store 64-bit floating point numbers.
@@ -213,9 +229,12 @@ pub unsafe extern "C" fn visit_field_double(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable)
+        })
+    }
 }
 
 /// Visit a boolean field. Boolean fields store true/false values.
@@ -231,9 +250,12 @@ pub unsafe extern "C" fn visit_field_boolean(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable)
+        })
+    }
 }
 
 /// Visit a binary field. Binary fields store arbitrary byte arrays.
@@ -249,9 +271,12 @@ pub unsafe extern "C" fn visit_field_binary(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable)
+        })
+    }
 }
 
 /// Visit a date field. Date fields store calendar dates without time information.
@@ -267,9 +292,12 @@ pub unsafe extern "C" fn visit_field_date(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable)
+        })
+    }
 }
 
 /// Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
@@ -285,9 +313,12 @@ pub unsafe extern "C" fn visit_field_timestamp(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Timestamp, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::Timestamp, nullable)
+        })
+    }
 }
 
 /// Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
@@ -303,9 +334,12 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNtz, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNtz, nullable)
+        })
+    }
 }
 
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
@@ -324,9 +358,12 @@ pub unsafe extern "C" fn visit_field_decimal(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_decimal_impl(state, name_str, precision, scale, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_decimal_impl(state, name_str, precision, scale, nullable)
+        })
+    }
 }
 
 fn visit_field_decimal_impl(
@@ -372,11 +409,14 @@ pub unsafe extern "C" fn visit_field_struct(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str: Result<&str, Error> = TryFromStringSlice::try_from_slice(&name);
+            let field_ids = std::slice::from_raw_parts(field_ids, field_count);
 
-    visit_field_struct_impl(state, name_str, field_ids, nullable)
-        .into_extern_result(&allocate_error)
+            visit_field_struct_impl(state, name_str, field_ids, nullable)
+        })
+    }
 }
 
 // Helper to create struct DataType from field IDs
@@ -425,9 +465,12 @@ pub unsafe extern "C" fn visit_field_array(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_array_impl(state, name_str, element_type_id, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_array_impl(state, name_str, element_type_id, nullable)
+        })
+    }
 }
 
 fn visit_field_array_impl(
@@ -468,9 +511,12 @@ pub unsafe extern "C" fn visit_field_map(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_map_impl(state, name_str, key_type_id, value_type_id, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_map_impl(state, name_str, key_type_id, value_type_id, nullable)
+        })
+    }
 }
 
 fn visit_field_map_impl(
@@ -519,9 +565,12 @@ pub unsafe extern "C" fn visit_field_variant(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_variant_impl(state, name_str, variant_struct_id, nullable)
-        .into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name_str = TryFromStringSlice::try_from_slice(&name);
+            visit_field_variant_impl(state, name_str, variant_struct_id, nullable)
+        })
+    }
 }
 
 fn visit_field_variant_impl(

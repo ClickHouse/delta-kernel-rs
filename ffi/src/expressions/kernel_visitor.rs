@@ -11,10 +11,11 @@ use delta_kernel::DeltaResult;
 
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
-    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
+    AllocateErrorFn, EngineIterator, ExternResult, KernelStringSlice, ReferenceSet,
+    TryFromStringSlice,
 };
 
 pub(crate) enum ExpressionOrPredicate {
@@ -225,8 +226,12 @@ pub unsafe extern "C" fn visit_expression_column(
     name: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_expression_column_impl(state, name).into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let name = TryFromStringSlice::try_from_slice(&name);
+            visit_expression_column_impl(state, name)
+        })
+    }
 }
 fn visit_expression_column_impl(
     state: &mut KernelExpressionVisitorState,
@@ -262,8 +267,12 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     value: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let value = String::try_from_slice(&value);
+            visit_expression_literal_string_impl(state, value)
+        })
+    }
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -385,8 +394,9 @@ pub extern "C" fn visit_expression_literal_decimal(
 ) -> ExternResult<usize> {
     // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     unsafe {
-        visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale)
-            .into_extern_result(&allocate_error)
+        catch_panic_into_result(&allocate_error, || {
+            visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale)
+        })
     }
 }
 
@@ -556,8 +566,9 @@ pub extern "C" fn visit_expression_literal_null(
 ) -> ExternResult<usize> {
     // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     unsafe {
-        visit_expression_literal_null_impl(state, type_tag, precision, scale)
-            .into_extern_result(&allocate_error)
+        catch_panic_into_result(&allocate_error, || {
+            visit_expression_literal_null_impl(state, type_tag, precision, scale)
+        })
     }
 }
 
@@ -640,7 +651,11 @@ pub unsafe extern "C" fn visit_engine_expression(
     engine_expression: &mut EngineExpression,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExpression>> {
-    visit_engine_expression_impl(engine_expression).into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            visit_engine_expression_impl(engine_expression)
+        })
+    }
 }
 
 fn visit_engine_expression_impl(
@@ -670,7 +685,11 @@ pub unsafe extern "C" fn visit_engine_predicate(
     engine_predicate: &mut EnginePredicate,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedPredicate>> {
-    visit_engine_predicate_impl(engine_predicate).into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            visit_engine_predicate_impl(engine_predicate)
+        })
+    }
 }
 
 fn visit_engine_predicate_impl(

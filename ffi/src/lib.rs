@@ -14,7 +14,7 @@ use std::sync::Arc;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -40,13 +40,15 @@ use handle::Handle;
 extern crate self as delta_kernel_ffi;
 
 mod domain_metadata;
+mod panic;
 pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
-use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
+use error::{AllocateError, AllocateErrorFn, ExternResult};
+use panic::catch_panic_into_result;
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
@@ -234,7 +236,7 @@ pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
-    allocate_kernel_string_impl(kernel_str).into_extern_result(&error_fn)
+    unsafe { catch_panic_into_result(&error_fn, || allocate_kernel_string_impl(kernel_str)) }
 }
 
 fn allocate_kernel_string_impl(
@@ -511,8 +513,12 @@ pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<*mut EngineBuilder> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let url = unwrap_and_parse_path_as_url(path);
+            get_engine_builder_impl(url, allocate_error)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -541,7 +547,12 @@ pub unsafe extern "C" fn set_builder_option(
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> ExternResult<bool> {
-    set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
+    let allocate_fn = builder.allocate_fn;
+    unsafe {
+        catch_panic_into_result(&allocate_fn, || {
+            set_builder_option_impl(builder, key, value)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -599,7 +610,7 @@ pub unsafe extern "C" fn builder_build(
     let builder_box = unsafe { Box::from_raw(builder) };
     let allocate_fn = builder_box.allocate_fn;
     unsafe {
-        catch_unwind_into_extern_result(&allocate_fn, move || {
+        catch_panic_into_result(&allocate_fn, move || {
             get_default_engine_impl(
                 builder_box.url,
                 builder_box.options,
@@ -624,25 +635,6 @@ pub unsafe extern "C" fn free_engine_builder(builder: *mut EngineBuilder) {
     let _ = unsafe { Box::from_raw(builder) };
 }
 
-/// Run `f`, catching any panic that would otherwise abort the process at the `extern "C"`
-/// boundary, and convert it into a kernel error. delta-kernel / arrow-rs / object-store / tokio
-/// can panic deep in the call stack: for example `object_store` unwraps an `InvalidHeaderValue`
-/// when a credential is valid UTF-8 but not a valid HTTP header value, the panic kills a
-/// `TokioBackgroundExecutor` worker, and the executor then panics on the calling thread. Without
-/// this guard that unwind reaches `panic_cannot_unwind` and aborts the server.
-///
-/// # Safety
-///
-/// The allocator must be valid.
-unsafe fn catch_unwind_into_extern_result<T>(
-    alloc: &dyn AllocateError,
-    f: impl FnOnce() -> DeltaResult<T>,
-) -> ExternResult<T> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .unwrap_or_else(|_| Err(Error::generic("delta-kernel-rs panicked across the FFI boundary")));
-    unsafe { result.into_extern_result(alloc) }
-}
-
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
@@ -652,8 +644,12 @@ pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExternEngine>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_default_default_engine_impl(url, allocate_error).into_extern_result(&allocate_error)
+    unsafe {
+        catch_panic_into_result(&allocate_error, || {
+            let url = unwrap_and_parse_path_as_url(path);
+            get_default_default_engine_impl(url, allocate_error)
+        })
+    }
 }
 
 // get the default version of the default engine :)
@@ -743,7 +739,7 @@ pub unsafe extern "C" fn snapshot(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&engine, move || {
+        catch_panic_into_result(&engine, move || {
             let url = unwrap_and_parse_path_as_url(path);
             snapshot_impl(url, engine, None, Vec::new())
         })
@@ -766,7 +762,7 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let engine_ref = unsafe { engine.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&engine_ref, move || {
+        catch_panic_into_result(&engine_ref, move || {
             let url = unwrap_and_parse_path_as_url(path);
             let log_tail = log_paths.log_paths()?;
             snapshot_impl(url, engine_ref, None, log_tail)
@@ -788,7 +784,7 @@ pub unsafe extern "C" fn snapshot_at_version(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&engine, move || {
+        catch_panic_into_result(&engine, move || {
             let url = unwrap_and_parse_path_as_url(path);
             snapshot_impl(url, engine, version.into(), Vec::new())
         })
@@ -811,7 +807,7 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let engine_ref = unsafe { engine.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&engine_ref, move || {
+        catch_panic_into_result(&engine_ref, move || {
             let url = unwrap_and_parse_path_as_url(path);
             let log_tail = log_tail.log_paths()?;
             snapshot_impl(url, engine_ref, version.into(), log_tail)
@@ -896,12 +892,13 @@ pub unsafe extern "C" fn get_snapshot_builder(
 ) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let source = match url {
-        Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => return DeltaResult::Err(e).into_extern_result(&engine_ref),
-    };
-    make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
+    unsafe {
+        catch_panic_into_result(&engine_ref, || {
+            let url = unwrap_and_parse_path_as_url(path)?;
+            let source = FfiSnapshotBuilderSource::TableRoot(url);
+            make_snapshot_builder(source, engine_arc)
+        })
+    }
 }
 
 /// Get a builder for incrementally updating an existing snapshot.
@@ -922,11 +919,14 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
-    make_snapshot_builder(
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
-        engine_arc,
-    )
-    .into_extern_result(&engine_ref)
+    unsafe {
+        catch_panic_into_result(&engine_ref, || {
+            make_snapshot_builder(
+                FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
+                engine_arc,
+            )
+        })
+    }
 }
 
 /// Set the target version on a snapshot builder. When omitted, the snapshot is created at the
@@ -954,10 +954,14 @@ pub unsafe extern "C" fn snapshot_builder_set_log_tail(
     builder: &mut Handle<MutableFfiSnapshotBuilder>,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<bool> {
-    let builder_mut = unsafe { builder.as_mut() };
-    let engine_arc = builder_mut.engine.clone();
+    let engine_arc = unsafe { builder.as_mut() }.engine.clone();
     let engine_ref = engine_arc.as_ref();
-    snapshot_builder_set_log_tail_impl(builder_mut, log_tail).into_extern_result(&engine_ref)
+    unsafe {
+        catch_panic_into_result(&engine_ref, || {
+            let builder_mut = builder.as_mut();
+            snapshot_builder_set_log_tail_impl(builder_mut, log_tail)
+        })
+    }
 }
 
 unsafe fn snapshot_builder_set_log_tail_impl(
@@ -997,7 +1001,7 @@ pub unsafe extern "C" fn snapshot_builder_build(
     let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
     unsafe {
-        catch_unwind_into_extern_result(&engine_ref, move || {
+        catch_panic_into_result(&engine_ref, move || {
             snapshot_builder_build_impl(*builder_box)
         })
     }
@@ -1054,9 +1058,13 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    snapshot_checkpoint_impl(snapshot, engine_ref).into_extern_result(&engine_ref)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot = snapshot.clone_as_arc();
+            snapshot_checkpoint_impl(snapshot, engine_ref)
+        })
+    }
 }
 
 fn snapshot_checkpoint_impl(
@@ -1097,11 +1105,13 @@ pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_timestamp(engine_ref.engine().as_ref())
-        .into_extern_result(&engine_ref)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot = snapshot.as_ref();
+            snapshot.get_timestamp(engine_ref.engine().as_ref())
+        })
+    }
 }
 
 /// Get the logical schema of the specified snapshot

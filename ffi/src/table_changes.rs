@@ -16,11 +16,12 @@ use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
+use crate::panic::catch_panic_into_result;
 use crate::scan::EnginePredicate;
 use crate::{
-    catch_unwind_into_extern_result, kernel_string_slice, unwrap_and_parse_path_as_url,
-    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema,
+    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
+    ExternResult, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
+    SharedSchema,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -44,7 +45,7 @@ pub unsafe extern "C" fn table_changes_from_version(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&engine, move || {
+        catch_panic_into_result(&engine, move || {
             let url = unwrap_and_parse_path_as_url(path);
             table_changes_impl(url, engine, start_version, None)
         })
@@ -70,7 +71,7 @@ pub unsafe extern "C" fn table_changes_between_versions(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&engine, move || {
+        catch_panic_into_result(&engine, move || {
             let url = unwrap_and_parse_path_as_url(path);
             table_changes_impl(url, engine, start_version, end_version.into())
         })
@@ -174,7 +175,7 @@ pub unsafe extern "C" fn table_changes_scan(
     let engine = unsafe { engine.as_ref() };
     let table_changes = unsafe { table_changes.into_inner() };
     unsafe {
-        catch_unwind_into_extern_result(&engine, move || {
+        catch_panic_into_result(&engine, move || {
             table_changes_scan_impl(*table_changes, predicate)
         })
     }
@@ -279,7 +280,7 @@ pub unsafe extern "C" fn table_changes_scan_execute(
     let engine = unsafe { engine.clone_as_arc() };
     let engine_for_impl = engine.clone();
     unsafe {
-        catch_unwind_into_extern_result(&engine.as_ref(), move || {
+        catch_panic_into_result(&engine.as_ref(), move || {
             table_changes_scan_execute_impl(table_changes_scan, engine_for_impl)
         })
     }
@@ -325,7 +326,7 @@ pub unsafe extern "C" fn scan_table_changes_next(
 ) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&data.engine.as_ref(), move || {
+        catch_panic_into_result(&data.engine.as_ref(), move || {
             scan_table_changes_next_impl(data)
         })
     }
@@ -402,7 +403,7 @@ pub unsafe extern "C" fn table_changes_scan_files_iter_init(
     let engine = unsafe { engine.clone_as_arc() };
     let engine_for_impl = engine.clone();
     unsafe {
-        catch_unwind_into_extern_result(&engine.as_ref(), move || {
+        catch_panic_into_result(&engine.as_ref(), move || {
             table_changes_scan_files_iter_init_impl(table_changes_scan, engine_for_impl)
         })
     }
@@ -435,7 +436,7 @@ pub unsafe extern "C" fn table_changes_scan_files_next(
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
     unsafe {
-        catch_unwind_into_extern_result(&data.engine.as_ref(), move || {
+        catch_panic_into_result(&data.engine.as_ref(), move || {
             table_changes_scan_files_next_impl(data, engine_context, callback)
         })
     }

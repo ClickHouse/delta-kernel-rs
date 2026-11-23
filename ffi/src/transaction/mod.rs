@@ -12,8 +12,9 @@ use delta_kernel::transaction::create_table::{
 use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
@@ -60,9 +61,13 @@ pub unsafe extern "C" fn transaction(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    transaction_impl(url, engine).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let url = unwrap_and_parse_path_as_url(path);
+            let engine = engine.as_ref();
+            transaction_impl(url, engine)
+        })
+    }
 }
 
 fn transaction_impl(
@@ -88,10 +93,14 @@ pub unsafe extern "C" fn transaction_with_committer(
     engine: Handle<SharedExternEngine>,
     committer: Handle<MutableCommitter>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    let engine = unsafe { engine.as_ref() };
-    let committer = unsafe { committer.into_inner() };
-    transaction_with_committer_impl(snapshot, engine, committer).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.clone_as_arc();
+            let engine = engine.as_ref();
+            let committer = committer.into_inner();
+            transaction_with_committer_impl(snapshot, engine, committer)
+        })
+    }
 }
 
 fn transaction_with_committer_impl(
@@ -153,9 +162,12 @@ pub unsafe extern "C" fn with_engine_info(
     engine_info: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            with_engine_info_impl(*txn, engine_info)
+        })
+    }
 }
 
 fn with_engine_info_impl(
@@ -179,9 +191,12 @@ pub unsafe extern "C" fn with_operation(
     operation: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_operation_impl(*txn, operation).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            with_operation_impl(*txn, operation)
+        })
+    }
 }
 
 fn with_operation_impl(
@@ -213,9 +228,12 @@ pub unsafe extern "C" fn with_domain_metadata(
     configuration: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            with_domain_metadata_impl(*txn, domain, configuration)
+        })
+    }
 }
 
 fn with_domain_metadata_impl(
@@ -244,9 +262,12 @@ pub unsafe extern "C" fn with_domain_metadata_removed(
     domain: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_domain_metadata_removed_impl(*txn, domain).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            with_domain_metadata_removed_impl(*txn, domain)
+        })
+    }
 }
 
 fn with_domain_metadata_removed_impl(
@@ -301,11 +322,14 @@ pub unsafe extern "C" fn commit(
     txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            let extern_engine = engine.as_ref();
+            let engine = extern_engine.engine();
+            commit_result_to_committed_handle(txn.commit(engine.as_ref()))
+        })
+    }
 }
 
 // ============================================================================
@@ -333,9 +357,12 @@ pub unsafe extern "C" fn create_table_with_engine_info(
     engine_info: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    create_table_with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            create_table_with_engine_info_impl(*txn, engine_info)
+        })
+    }
 }
 
 fn create_table_with_engine_info_impl(
@@ -393,11 +420,14 @@ pub unsafe extern "C" fn create_table_commit(
     txn: Handle<ExclusiveCreateTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.into_inner();
+            let extern_engine = engine.as_ref();
+            let engine = extern_engine.engine();
+            commit_result_to_committed_handle(txn.commit(engine.as_ref()))
+        })
+    }
 }
 
 // ============================================================================
@@ -495,10 +525,13 @@ pub unsafe extern "C" fn get_create_table_builder(
     engine_info: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
-    let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    get_create_table_builder_impl(path, schema, info).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let path = TryFromStringSlice::try_from_slice(&path);
+            let info = TryFromStringSlice::try_from_slice(&engine_info);
+            get_create_table_builder_impl(path, schema, info)
+        })
+    }
 }
 
 fn get_create_table_builder_impl(
@@ -534,11 +567,14 @@ pub unsafe extern "C" fn create_table_builder_with_table_property(
     value: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let builder = unsafe { *builder.into_inner() };
-    let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
-    create_table_builder_with_table_property_impl(builder, key, value).into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = *builder.into_inner();
+            let key = TryFromStringSlice::try_from_slice(&key);
+            let value = TryFromStringSlice::try_from_slice(&value);
+            create_table_builder_with_table_property_impl(builder, key, value)
+        })
+    }
 }
 
 fn create_table_builder_with_table_property_impl(
@@ -564,11 +600,14 @@ pub unsafe extern "C" fn create_table_builder_build(
     builder: Handle<ExclusiveCreateTableBuilder>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let builder = unsafe { *builder.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let committer = Box::new(FileSystemCommitter::new());
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = *builder.into_inner();
+            let extern_engine = engine.as_ref();
+            let committer = Box::new(FileSystemCommitter::new());
+            create_table_builder_build_impl(builder, committer, extern_engine)
+        })
+    }
 }
 
 /// Build a create-table transaction with a custom committer. Same as
@@ -584,11 +623,14 @@ pub unsafe extern "C" fn create_table_builder_build_with_committer(
     committer: Handle<MutableCommitter>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let builder = unsafe { *builder.into_inner() };
-    let committer = unsafe { committer.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = *builder.into_inner();
+            let committer = committer.into_inner();
+            let extern_engine = engine.as_ref();
+            create_table_builder_build_impl(builder, committer, extern_engine)
+        })
+    }
 }
 
 fn create_table_builder_build_impl(
@@ -648,22 +690,22 @@ pub unsafe extern "C" fn remove_files(
     selection_vector_len: usize,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let engine = unsafe { engine.as_ref() };
-    let data = unsafe { data.into_inner() };
-    let txn = unsafe { txn.as_mut() };
-    // empty sv = all rows selected (per FilteredEngineData contract)
-    let sv = if selection_vector.is_null() || selection_vector_len == 0 {
-        vec![]
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) };
-        raw.iter().map(|&b| b != 0).collect()
-    };
-    let result: DeltaResult<bool> = (|| {
-        let filtered = FilteredEngineData::try_new(data, sv)?;
-        txn.remove_files(filtered);
-        Ok(true)
-    })();
-    result.into_extern_result(&engine)
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let data = data.into_inner();
+            let txn = txn.as_mut();
+            // empty sv = all rows selected (per FilteredEngineData contract)
+            let sv = if selection_vector.is_null() || selection_vector_len == 0 {
+                vec![]
+            } else {
+                let raw = std::slice::from_raw_parts(selection_vector, selection_vector_len);
+                raw.iter().map(|&b| b != 0).collect()
+            };
+            let filtered = FilteredEngineData::try_new(data, sv)?;
+            txn.remove_files(filtered);
+            Ok(true)
+        })
+    }
 }
 
 #[cfg(test)]
