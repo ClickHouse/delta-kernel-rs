@@ -7,5 +7,5 @@ pub struct Foo(u32);
 pub struct SharedFoo;
 
 fn main() {
-    let _: Handle<SharedFoo> = Handle { ptr: std::ptr::NonNull::dangling() };
+    let _: Handle<SharedFoo> = Handle { ptr: std::ptr::null_mut() };
 }
