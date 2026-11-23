@@ -145,59 +145,89 @@ pub extern "C" fn visit_expression_divide(
     visit_expression_binary(state, BinaryExpressionOp::Divide, a, b)
 }
 
+/// # Safety
+///
+/// `state` must point to a valid visitor state. A raw pointer, not a reference: C++ calls this through a function
+/// pointer, and the CFI type id of a reference does not match a C/C++ pointer.
 #[no_mangle]
-pub extern "C" fn visit_predicate_lt(
-    state: &mut KernelExpressionVisitorState,
+pub unsafe extern "C" fn visit_predicate_lt(
+    state: *mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
+    let state = unsafe { &mut *state };
     visit_predicate_binary(state, BinaryPredicateOp::LessThan, a, b)
 }
 
+/// # Safety
+///
+/// `state` must point to a valid visitor state. A raw pointer, not a reference: C++ calls this through a function
+/// pointer, and the CFI type id of a reference does not match a C/C++ pointer.
 #[no_mangle]
-pub extern "C" fn visit_predicate_le(
-    state: &mut KernelExpressionVisitorState,
+pub unsafe extern "C" fn visit_predicate_le(
+    state: *mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
+    let state = unsafe { &mut *state };
     let p = visit_predicate_binary(state, BinaryPredicateOp::GreaterThan, a, b);
     visit_predicate_not(state, p)
 }
 
+/// # Safety
+///
+/// `state` must point to a valid visitor state. A raw pointer, not a reference: C++ calls this through a function
+/// pointer, and the CFI type id of a reference does not match a C/C++ pointer.
 #[no_mangle]
-pub extern "C" fn visit_predicate_gt(
-    state: &mut KernelExpressionVisitorState,
+pub unsafe extern "C" fn visit_predicate_gt(
+    state: *mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
+    let state = unsafe { &mut *state };
     visit_predicate_binary(state, BinaryPredicateOp::GreaterThan, a, b)
 }
 
+/// # Safety
+///
+/// `state` must point to a valid visitor state. A raw pointer, not a reference: C++ calls this through a function
+/// pointer, and the CFI type id of a reference does not match a C/C++ pointer.
 #[no_mangle]
-pub extern "C" fn visit_predicate_ge(
-    state: &mut KernelExpressionVisitorState,
+pub unsafe extern "C" fn visit_predicate_ge(
+    state: *mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
+    let state = unsafe { &mut *state };
     let p = visit_predicate_binary(state, BinaryPredicateOp::LessThan, a, b);
     visit_predicate_not(state, p)
 }
 
+/// # Safety
+///
+/// `state` must point to a valid visitor state. A raw pointer, not a reference: C++ calls this through a function
+/// pointer, and the CFI type id of a reference does not match a C/C++ pointer.
 #[no_mangle]
-pub extern "C" fn visit_predicate_eq(
-    state: &mut KernelExpressionVisitorState,
+pub unsafe extern "C" fn visit_predicate_eq(
+    state: *mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
+    let state = unsafe { &mut *state };
     visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b)
 }
 
+/// # Safety
+///
+/// `state` must point to a valid visitor state. A raw pointer, not a reference: C++ calls this through a function
+/// pointer, and the CFI type id of a reference does not match a C/C++ pointer.
 #[no_mangle]
-pub extern "C" fn visit_predicate_ne(
-    state: &mut KernelExpressionVisitorState,
+pub unsafe extern "C" fn visit_predicate_ne(
+    state: *mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
+    let state = unsafe { &mut *state };
     let p = visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b);
     visit_predicate_not(state, p)
 }

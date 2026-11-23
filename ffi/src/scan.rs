@@ -948,7 +948,7 @@ mod scan_builder_tests {
             ))
         };
         let lit = visit_expression_literal_int(state, 10);
-        visit_predicate_lt(state, col, lit)
+        unsafe { visit_predicate_lt(state, col, lit) }
     }
 
     #[tokio::test]
