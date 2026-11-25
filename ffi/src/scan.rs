@@ -294,23 +294,6 @@ pub unsafe extern "C" fn scan_builder_build(
     }
 }
 
-/// Make the scan built by an [`ExclusiveScanBuilder`] parse the statistics of all columns of each
-/// file, so that the scan callback receives them in [`Stats::columns`].
-///
-/// Consumes the `builder` handle and returns a new handle. The `builder` handle must not be used
-/// after this call.
-///
-/// # Safety
-///
-/// `builder` must be a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn scan_builder_with_all_stats_columns(
-    builder: Handle<ExclusiveScanBuilder>,
-) -> Handle<ExclusiveScanBuilder> {
-    let builder = unsafe { builder.into_inner() };
-    Box::new(builder.include_all_stats_columns()).into()
-}
-
 /// Free an [`ExclusiveScanBuilder`] without building a scan.
 ///
 /// Only call this if you will not call [`scan_builder_build`]. If you have already called
@@ -488,63 +471,9 @@ pub struct Stats {
     /// in the data file. In the presence of Deletion Vectors the statistics may be somewhat
     /// outdated, i.e. not reflecting deleted rows yet.
     pub num_records: u64,
-    /// The statistics of the columns of the file, `columns_len` elements. Empty unless the scan was
-    /// built with [`scan_builder_with_all_stats_columns`]. Valid only during the callback.
-    pub columns: *const FileColumnStats,
-    /// The number of elements of `columns`
-    pub columns_len: usize,
-}
-
-/// The unscaled value, precision and scale of a decimal statistic
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FileStatsDecimal {
-    /// The low 64 bits of the unscaled value
-    pub low: u64,
-    /// The high 64 bits of the unscaled value
-    pub high: i64,
-    /// The precision of the decimal type
-    pub precision: u8,
-    /// The scale of the decimal type
-    pub scale: u8,
-}
-
-/// A `minValues` or `maxValues` statistic of a column, typed by the physical type of the column
-#[repr(C)]
-pub enum FileStatsValue {
-    /// No statistic, or a statistic of a type without min/max data skipping
-    Absent,
-    Byte(i8),
-    Short(i16),
-    Integer(i32),
-    Long(i64),
-    Float(f32),
-    Double(f64),
-    String(KernelStringSlice),
-    /// Days since the epoch
-    Date(i32),
-    /// Microseconds since the epoch, as written in the log (truncated to milliseconds by most
-    /// writers)
-    Timestamp(i64),
-    /// Microseconds since the epoch, as written in the log (truncated to milliseconds by most
-    /// writers)
-    TimestampNtz(i64),
-    Decimal(FileStatsDecimal),
-}
-
-/// The statistics of one leaf column of a file
-#[repr(C)]
-pub struct FileColumnStats {
-    /// The physical names of the column and of the structs that contain it, `path_len` elements
-    pub path: *const KernelStringSlice,
-    /// The number of elements of `path`
-    pub path_len: usize,
-    /// The `minValues` statistic
-    pub min: FileStatsValue,
-    /// The `maxValues` statistic
-    pub max: FileStatsValue,
-    /// The `nullCount` statistic, or a negative value if it is unknown
-    pub null_count: i64,
+    /// The `stats` JSON string of the `add` action of the file, as written in the log. Valid only
+    /// during the callback.
+    pub json: KernelStringSlice,
 }
 
 /// Contains information that can be used to get a selection vector. If `has_vector` is false, that
@@ -782,46 +711,15 @@ pub unsafe extern "C" fn free_kernel_dv_info(data: Handle<SharedDvInfo>) {
 
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
 // and then calls the ffi specified callback. Returns true to continue iteration, false to stop.
-fn rust_callback(context: &mut ContextWrapper<'_>, scan_file: ScanFile) -> bool {
+fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) -> bool {
     let transform = scan_file.transform.map(|e| e.into());
     let partition_map = CStringMap {
         values: scan_file.partition_values,
     };
-    let parsed_stats = context
-        .stats_parsed
-        .map(|stats_parsed| parsed_stats::collect(stats_parsed, scan_file.row_index))
-        .unwrap_or_default();
-    let column_paths: Vec<Vec<KernelStringSlice>> = parsed_stats
-        .columns
-        .iter()
-        .map(|column| {
-            column
-                .path
-                .iter()
-                .map(|name| unsafe { KernelStringSlice::new_unsafe(name) })
-                .collect()
-        })
-        .collect();
-    let columns: Vec<FileColumnStats> = parsed_stats
-        .columns
-        .iter()
-        .zip(column_paths.iter())
-        .map(|(column, path)| FileColumnStats {
-            path: path.as_ptr(),
-            path_len: path.len(),
-            min: parsed_stats::to_stats_value(column.min.as_ref()),
-            max: parsed_stats::to_stats_value(column.max.as_ref()),
-            null_count: column.null_count.unwrap_or(-1),
-        })
-        .collect();
-    let num_records = scan_file
-        .stats
-        .map(|ks| ks.num_records)
-        .or(parsed_stats.num_records);
-    let stats = num_records.map(|num_records| Stats {
-        num_records,
-        columns: columns.as_ptr(),
-        columns_len: columns.len(),
+    let stats_json = scan_file.stats_json.unwrap_or_default();
+    let stats = scan_file.stats.map(|ks| Stats {
+        num_records: ks.num_records,
+        json: kernel_string_slice!(stats_json),
     });
     let has_vector = scan_file.dv_info.has_vector();
     let dv_info = CDvInfo {
@@ -843,10 +741,9 @@ fn rust_callback(context: &mut ContextWrapper<'_>, scan_file: ScanFile) -> bool 
 }
 
 // Wrap up stuff from C so we can pass it through to our callback
-struct ContextWrapper<'a> {
+struct ContextWrapper {
     engine_context: NullableCvoid,
     callback: CScanCallback,
-    stats_parsed: Option<parsed_stats::StatsParsedColumn<'a>>,
 }
 
 /// Shim for ffi to call visit_scan_metadata. This will generally be called when iterating through
@@ -876,169 +773,9 @@ fn visit_scan_metadata_impl(
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
-        stats_parsed: parsed_stats::stats_parsed_column(scan_metadata.scan_files.data()),
     };
     scan_metadata.visit_scan_files(context_wrapper, rust_callback)?;
     Ok(true)
-}
-
-mod parsed_stats {
-    use delta_kernel::expressions::Scalar;
-
-    use super::{FileStatsDecimal, FileStatsValue};
-    use crate::KernelStringSlice;
-
-    /// The statistics of one leaf column of a file
-    pub(super) struct ColumnStats {
-        pub(super) path: Vec<String>,
-        pub(super) min: Option<Scalar>,
-        pub(super) max: Option<Scalar>,
-        pub(super) null_count: Option<i64>,
-    }
-
-    /// The statistics of a file from the `stats_parsed` column of the scan metadata
-    #[derive(Default)]
-    pub(super) struct FileStats {
-        pub(super) num_records: Option<u64>,
-        pub(super) columns: Vec<ColumnStats>,
-    }
-
-    /// Borrows the string of a [`Scalar::String`], which must outlive the use of the result.
-    pub(super) fn to_stats_value(value: Option<&Scalar>) -> FileStatsValue {
-        match value {
-            Some(Scalar::Byte(v)) => FileStatsValue::Byte(*v),
-            Some(Scalar::Short(v)) => FileStatsValue::Short(*v),
-            Some(Scalar::Integer(v)) => FileStatsValue::Integer(*v),
-            Some(Scalar::Long(v)) => FileStatsValue::Long(*v),
-            Some(Scalar::Float(v)) => FileStatsValue::Float(*v),
-            Some(Scalar::Double(v)) => FileStatsValue::Double(*v),
-            Some(Scalar::String(v)) => {
-                FileStatsValue::String(unsafe { KernelStringSlice::new_unsafe(v) })
-            }
-            Some(Scalar::Date(v)) => FileStatsValue::Date(*v),
-            Some(Scalar::Timestamp(v)) => FileStatsValue::Timestamp(*v),
-            Some(Scalar::TimestampNtz(v)) => FileStatsValue::TimestampNtz(*v),
-            Some(Scalar::Decimal(v)) => {
-                let bits = v.bits();
-                FileStatsValue::Decimal(FileStatsDecimal {
-                    low: bits as u64,
-                    high: (bits >> 64) as i64,
-                    precision: v.precision(),
-                    scale: v.scale(),
-                })
-            }
-            _ => FileStatsValue::Absent,
-        }
-    }
-
-    #[cfg(feature = "default-engine-base")]
-    pub(super) type StatsParsedColumn<'a> = &'a delta_kernel::arrow::array::StructArray;
-
-    #[cfg(not(feature = "default-engine-base"))]
-    pub(super) type StatsParsedColumn<'a> = std::marker::PhantomData<&'a ()>;
-
-    #[cfg(feature = "default-engine-base")]
-    pub(super) fn stats_parsed_column(
-        data: &dyn delta_kernel::EngineData,
-    ) -> Option<StatsParsedColumn<'_>> {
-        use delta_kernel::arrow::array::AsArray;
-        use delta_kernel::engine::arrow_data::ArrowEngineData;
-
-        data.any_ref()
-            .downcast_ref::<ArrowEngineData>()?
-            .record_batch()
-            .column_by_name("stats_parsed")?
-            .as_struct_opt()
-    }
-
-    #[cfg(not(feature = "default-engine-base"))]
-    pub(super) fn stats_parsed_column(
-        _data: &dyn delta_kernel::EngineData,
-    ) -> Option<StatsParsedColumn<'_>> {
-        None
-    }
-
-    #[cfg(feature = "default-engine-base")]
-    pub(super) fn collect(stats_parsed: StatsParsedColumn<'_>, row: usize) -> FileStats {
-        use delta_kernel::arrow::array::{Array, AsArray};
-        use delta_kernel::arrow::datatypes::{DataType, Int64Type};
-        use delta_kernel::engine::arrow_conversion::scalar::extract_primitive_scalar;
-
-        #[derive(Clone, Copy)]
-        enum Kind {
-            Min,
-            Max,
-            NullCount,
-        }
-
-        fn visit(
-            array: &dyn Array,
-            row: usize,
-            kind: Kind,
-            path: &mut Vec<String>,
-            columns: &mut Vec<ColumnStats>,
-        ) {
-            if array.is_null(row) {
-                return;
-            }
-            if let Some(struct_array) = array.as_struct_opt() {
-                for (field, child) in struct_array.fields().iter().zip(struct_array.columns()) {
-                    path.push(field.name().clone());
-                    visit(child.as_ref(), row, kind, path, columns);
-                    path.pop();
-                }
-                return;
-            }
-            let index = match columns.iter().position(|column| column.path == *path) {
-                Some(index) => index,
-                None => {
-                    columns.push(ColumnStats {
-                        path: path.clone(),
-                        min: None,
-                        max: None,
-                        null_count: None,
-                    });
-                    columns.len() - 1
-                }
-            };
-            let column = &mut columns[index];
-            match kind {
-                Kind::Min => column.min = extract_primitive_scalar(array, row).ok(),
-                Kind::Max => column.max = extract_primitive_scalar(array, row).ok(),
-                Kind::NullCount => {
-                    if *array.data_type() == DataType::Int64 {
-                        column.null_count = Some(array.as_primitive::<Int64Type>().value(row));
-                    }
-                }
-            }
-        }
-
-        let mut stats = FileStats::default();
-        if stats_parsed.is_null(row) {
-            return stats;
-        }
-        if let Some(num_records) = stats_parsed.column_by_name("numRecords") {
-            if *num_records.data_type() == DataType::Int64 && num_records.is_valid(row) {
-                let value = num_records.as_primitive::<Int64Type>().value(row);
-                stats.num_records = u64::try_from(value).ok();
-            }
-        }
-        for (name, kind) in [
-            ("minValues", Kind::Min),
-            ("maxValues", Kind::Max),
-            ("nullCount", Kind::NullCount),
-        ] {
-            if let Some(array) = stats_parsed.column_by_name(name) {
-                visit(array.as_ref(), row, kind, &mut Vec::new(), &mut stats.columns);
-            }
-        }
-        stats
-    }
-
-    #[cfg(not(feature = "default-engine-base"))]
-    pub(super) fn collect(_stats_parsed: StatsParsedColumn<'_>, _row: usize) -> FileStats {
-        FileStats::default()
-    }
 }
 
 // === Arrow batch-mode scan metadata ===
