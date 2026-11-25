@@ -403,6 +403,274 @@ fn scan_metadata_iter_init_impl(
     Ok(Arc::new(data).into())
 }
 
+/// The scan metadata of a table version, listed without a predicate and with the selection vectors
+/// applied, that an engine keeps to scan the same or a newer version again, with any predicate,
+/// without replaying the log up to this version: see [`scan_metadata_iter_init_from_cached`].
+///
+/// Built with [`cached_scan_metadata_new`], [`cached_scan_metadata_add`] for each item of the scan
+/// of [`scan_for_cached_scan_metadata`], and [`cached_scan_metadata_finish`].
+#[cfg(feature = "default-engine-base")]
+pub struct CachedScanMetadata {
+    version: delta_kernel::Version,
+    batches: Vec<delta_kernel::arrow::array::RecordBatch>,
+}
+
+/// An exclusive handle to a [`CachedScanMetadata`] being built.
+#[cfg(feature = "default-engine-base")]
+#[handle_descriptor(target=CachedScanMetadata, mutable=true, sized=true)]
+pub struct ExclusiveCachedScanMetadata;
+
+/// A shared handle to a built [`CachedScanMetadata`].
+#[cfg(feature = "default-engine-base")]
+#[handle_descriptor(target=CachedScanMetadata, mutable=false, sized=true)]
+pub struct SharedCachedScanMetadata;
+
+/// Get the scan to build a [`CachedScanMetadata`] from: a scan without a predicate that also parses
+/// the statistics of the files, so that the files whose statistics a checkpoint has only in
+/// `stats_parsed` keep them in the cache. It is the responsibility of the _engine_ to free the scan
+/// by calling [`free_scan`].
+///
+/// # Safety
+///
+/// `snapshot` and `engine` must be valid handles.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_for_cached_scan_metadata(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedScan>> {
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.clone_as_arc();
+            Ok(Arc::new(snapshot.scan_builder().include_all_stats_columns().build()?).into())
+        })
+    }
+}
+
+/// Start building the [`CachedScanMetadata`] of the table version `version`.
+///
+/// The caller must eventually call either [`cached_scan_metadata_finish`] or
+/// [`free_exclusive_cached_scan_metadata`].
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub extern "C" fn cached_scan_metadata_new(
+    version: delta_kernel::Version,
+) -> Handle<ExclusiveCachedScanMetadata> {
+    Box::new(CachedScanMetadata {
+        version,
+        batches: Vec::new(),
+    })
+    .into()
+}
+
+/// Add an item of the scan of [`scan_for_cached_scan_metadata`], of the version of `cached`, to
+/// `cached`. Returns the number of the files the item selects.
+///
+/// # Safety
+///
+/// `cached`, `scan_metadata` and `engine` must be valid handles.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn cached_scan_metadata_add(
+    cached: &mut Handle<ExclusiveCachedScanMetadata>,
+    scan_metadata: Handle<SharedScanMetadata>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<usize> {
+    unsafe {
+        let cached = cached.as_mut();
+        let scan_metadata = scan_metadata.as_ref();
+        let extern_engine = engine.as_ref();
+        catch_panic_into_result(&extern_engine, || {
+            cached_scan_metadata_add_impl(cached, scan_metadata, extern_engine.engine().as_ref())
+        })
+    }
+}
+
+#[cfg(feature = "default-engine-base")]
+fn cached_scan_metadata_add_impl(
+    cached: &mut CachedScanMetadata,
+    scan_metadata: &ScanMetadata,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<usize> {
+    use delta_kernel::arrow::array::BooleanArray;
+    use delta_kernel::arrow::compute::filter_record_batch;
+    use delta_kernel::engine::arrow_conversion::TryFromArrow;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::{Expression, UnaryExpressionOp};
+    use delta_kernel::scan::scan_row_schema;
+    use delta_kernel::schema::StructType;
+    use delta_kernel::EngineData;
+
+    fn record_batch(data: &dyn EngineData) -> DeltaResult<&delta_kernel::arrow::array::RecordBatch> {
+        Ok(data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| Error::generic("Cached scan metadata requires Arrow engine data"))?
+            .record_batch())
+    }
+
+    // The scan rows keep the `stats` JSON, which `Scan::scan_metadata_from` parses again. A
+    // checkpoint written without `writeStatsAsJson` has the statistics only in `stats_parsed`, so
+    // take the JSON from there, as for the `remove` actions of a transaction.
+    let data = scan_metadata.scan_files.data();
+    let projected = if record_batch(data)?.schema_ref().column_with_name("stats_parsed").is_some() {
+        let row_schema = scan_row_schema();
+        let fields = row_schema.fields().map(|field| {
+            if field.name() == "stats" {
+                Expression::coalesce([
+                    Expression::column(["stats"]),
+                    Expression::unary(UnaryExpressionOp::ToJson, Expression::column(["stats_parsed"])),
+                ])
+            } else {
+                Expression::column([field.name().as_str()])
+            }
+        });
+        let input_schema = Arc::new(
+            StructType::try_from_arrow(record_batch(data)?.schema())
+                .map_err(|e| Error::generic(e.to_string()))?,
+        );
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            input_schema,
+            Arc::new(Expression::struct_from(fields)),
+            row_schema.into(),
+        )?;
+        Some(evaluator.evaluate(data)?)
+    } else {
+        None
+    };
+    let batch = record_batch(projected.as_deref().unwrap_or(data))?;
+    let mut selection_vector = scan_metadata.scan_files.selection_vector().to_vec();
+    selection_vector.resize(batch.num_rows(), true);
+    let selected = filter_record_batch(batch, &BooleanArray::from(selection_vector))
+        .map_err(|e| Error::generic(e.to_string()))?;
+    let num_files = selected.num_rows();
+    cached.batches.push(selected);
+    Ok(num_files)
+}
+
+/// Finish building a [`CachedScanMetadata`]. Consumes `cached`.
+///
+/// The caller must free the returned handle with [`free_cached_scan_metadata`].
+///
+/// # Safety
+///
+/// `cached` must be a valid handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn cached_scan_metadata_finish(
+    cached: Handle<ExclusiveCachedScanMetadata>,
+) -> Handle<SharedCachedScanMetadata> {
+    let cached = unsafe { cached.into_inner() };
+    Arc::new(*cached).into()
+}
+
+/// Free a [`CachedScanMetadata`] that was not finished.
+///
+/// # Safety
+///
+/// `cached` must be a valid handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_exclusive_cached_scan_metadata(
+    cached: Handle<ExclusiveCachedScanMetadata>,
+) {
+    unsafe { cached.drop_handle() };
+}
+
+/// Free a [`SharedCachedScanMetadata`] handle.
+///
+/// # Safety
+///
+/// `cached` must be a valid handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_cached_scan_metadata(cached: Handle<SharedCachedScanMetadata>) {
+    unsafe { cached.drop_handle() };
+}
+
+/// The memory that the Arrow buffers of a [`CachedScanMetadata`] occupy, in bytes.
+///
+/// # Safety
+///
+/// `cached` must be a valid handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn cached_scan_metadata_memory_size(
+    cached: Handle<SharedCachedScanMetadata>,
+) -> usize {
+    let cached = unsafe { cached.as_ref() };
+    cached
+        .batches
+        .iter()
+        .map(|batch| batch.get_array_memory_size())
+        .sum()
+}
+
+/// The table version of a [`CachedScanMetadata`].
+///
+/// # Safety
+///
+/// `cached` must be a valid handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn cached_scan_metadata_version(
+    cached: Handle<SharedCachedScanMetadata>,
+) -> delta_kernel::Version {
+    unsafe { cached.as_ref() }.version
+}
+
+/// Get an iterator over the scan metadata of `scan` that starts from `cached` instead of the log:
+/// the files of the version of `cached` are filtered by the predicate of `scan` (data skipping by the
+/// statistics and the partition values, as in a scan that replays the log), and if the version of
+/// `scan` is newer, only the commits after the version of `cached` are read.
+///
+/// The version of `cached` must not be newer than the version of `scan`, and `cached` must have been
+/// built from a scan without a predicate. The returned iterator is used like the one of
+/// [`scan_metadata_iter_init`].
+///
+/// # Safety
+///
+/// `engine`, `scan` and `cached` must be valid handles.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_metadata_iter_init_from_cached(
+    engine: Handle<SharedExternEngine>,
+    scan: Handle<SharedScan>,
+    cached: Handle<SharedCachedScanMetadata>,
+) -> ExternResult<Handle<SharedScanMetadataIterator>> {
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.clone_as_arc();
+            let scan = scan.as_ref();
+            let cached = cached.as_ref();
+            scan_metadata_iter_init_from_cached_impl(&engine, scan, cached)
+        })
+    }
+}
+
+#[cfg(feature = "default-engine-base")]
+fn scan_metadata_iter_init_from_cached_impl(
+    engine: &Arc<dyn ExternEngine>,
+    scan: &Scan,
+    cached: &CachedScanMetadata,
+) -> DeltaResult<Handle<SharedScanMetadataIterator>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::EngineData;
+
+    let batches: Vec<Box<dyn EngineData>> = cached
+        .batches
+        .iter()
+        .map(|batch| Box::new(ArrowEngineData::new(batch.clone())) as Box<dyn EngineData>)
+        .collect();
+    let scan_metadata =
+        scan.scan_metadata_from(engine.engine().as_ref(), cached.version, batches, None)?;
+    let data = ScanMetadataIterator {
+        data: Mutex::new(scan_metadata),
+        engine: engine.clone(),
+    };
+    Ok(Arc::new(data).into())
+}
+
 /// Call the provided `engine_visitor` on the next scan metadata item. The visitor will be provided
 /// with a [`SharedScanMetadata`], which contains the actual scan files and the associated selection
 /// vector. It is the responsibility of the _engine_ to free the associated resources after use by

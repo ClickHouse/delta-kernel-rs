@@ -660,9 +660,9 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         existing_version: Version,
-        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send> + 'static,
         _existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
