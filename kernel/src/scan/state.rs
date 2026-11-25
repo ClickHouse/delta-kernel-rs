@@ -120,8 +120,6 @@ pub struct ScanFile {
     pub modification_time: i64,
     /// Statistics about the file
     pub stats: Option<Stats>,
-    /// The `stats` JSON string of the `add` action of the file, as written in the log
-    pub stats_json: Option<String>,
     /// A [`DvInfo`] struct, which allows getting the selection vector for this file
     pub dv_info: DvInfo,
     /// An optional expression that, if present, _must_ be applied to physical data to convert it
@@ -197,9 +195,9 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
                 let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
-                let stats_json: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
+                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
                 let stats: Option<Stats> =
-                    stats_json.as_ref().and_then(|json| match serde_json::from_str(json.as_str()) {
+                    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
                         Ok(stats) => Some(stats),
                         Err(e) => {
                             warn!("Invalid stats string in Add file {json}: {}", e);
@@ -219,7 +217,6 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     modification_time,
                     stats,
-                    stats_json,
                     dv_info,
                     transform: get_transform_for_row(row_index, self.transforms),
                     partition_values,

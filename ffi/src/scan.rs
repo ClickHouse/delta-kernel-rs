@@ -471,9 +471,6 @@ pub struct Stats {
     /// in the data file. In the presence of Deletion Vectors the statistics may be somewhat
     /// outdated, i.e. not reflecting deleted rows yet.
     pub num_records: u64,
-    /// The `stats` JSON string of the `add` action of the file, as written in the log. Valid only
-    /// during the callback.
-    pub json: KernelStringSlice,
 }
 
 /// Contains information that can be used to get a selection vector. If `has_vector` is false, that
@@ -716,10 +713,8 @@ fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) -> bool {
     let partition_map = CStringMap {
         values: scan_file.partition_values,
     };
-    let stats_json = scan_file.stats_json.unwrap_or_default();
     let stats = scan_file.stats.map(|ks| Stats {
         num_records: ks.num_records,
-        json: kernel_string_slice!(stats_json),
     });
     let has_vector = scan_file.dv_info.has_vector();
     let dv_info = CDvInfo {
