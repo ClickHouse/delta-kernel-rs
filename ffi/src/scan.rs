@@ -407,8 +407,8 @@ fn scan_metadata_iter_init_impl(
 /// applied, that an engine keeps to scan the same or a newer version again, with any predicate,
 /// without replaying the log up to this version: see [`scan_metadata_iter_init_from_cached`].
 ///
-/// Built with [`cached_scan_metadata_new`], [`cached_scan_metadata_add`] for each item of a scan
-/// without a predicate, and [`cached_scan_metadata_finish`].
+/// Built with [`cached_scan_metadata_new`], [`cached_scan_metadata_add`] for each item of the scan
+/// of [`scan_for_cached_scan_metadata`], and [`cached_scan_metadata_finish`].
 #[cfg(feature = "default-engine-base")]
 pub struct CachedScanMetadata {
     version: delta_kernel::Version,
@@ -424,6 +424,28 @@ pub struct ExclusiveCachedScanMetadata;
 #[cfg(feature = "default-engine-base")]
 #[handle_descriptor(target=CachedScanMetadata, mutable=false, sized=true)]
 pub struct SharedCachedScanMetadata;
+
+/// Get the scan to build a [`CachedScanMetadata`] from: a scan without a predicate that also parses
+/// the statistics of the files, so that the files whose statistics a checkpoint has only in
+/// `stats_parsed` keep them in the cache. It is the responsibility of the _engine_ to free the scan
+/// by calling [`free_scan`].
+///
+/// # Safety
+///
+/// `snapshot` and `engine` must be valid handles.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_for_cached_scan_metadata(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedScan>> {
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.clone_as_arc();
+            Ok(Arc::new(snapshot.scan_builder().include_all_stats_columns().build()?).into())
+        })
+    }
+}
 
 /// Start building the [`CachedScanMetadata`] of the table version `version`.
 ///
@@ -441,8 +463,8 @@ pub extern "C" fn cached_scan_metadata_new(
     .into()
 }
 
-/// Add an item of a scan without a predicate, of the version of `cached`, to `cached`. Returns the
-/// number of the files the item selects.
+/// Add an item of the scan of [`scan_for_cached_scan_metadata`], of the version of `cached`, to
+/// `cached`. Returns the number of the files the item selects.
 ///
 /// # Safety
 ///
@@ -457,8 +479,9 @@ pub unsafe extern "C" fn cached_scan_metadata_add(
     unsafe {
         let cached = cached.as_mut();
         let scan_metadata = scan_metadata.as_ref();
-        catch_panic_into_result(&engine.as_ref(), || {
-            cached_scan_metadata_add_impl(cached, scan_metadata)
+        let extern_engine = engine.as_ref();
+        catch_panic_into_result(&extern_engine, || {
+            cached_scan_metadata_add_impl(cached, scan_metadata, extern_engine.engine().as_ref())
         })
     }
 }
@@ -467,18 +490,55 @@ pub unsafe extern "C" fn cached_scan_metadata_add(
 fn cached_scan_metadata_add_impl(
     cached: &mut CachedScanMetadata,
     scan_metadata: &ScanMetadata,
+    engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<usize> {
     use delta_kernel::arrow::array::BooleanArray;
     use delta_kernel::arrow::compute::filter_record_batch;
+    use delta_kernel::engine::arrow_conversion::TryFromArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::{Expression, UnaryExpressionOp};
+    use delta_kernel::scan::scan_row_schema;
+    use delta_kernel::schema::StructType;
+    use delta_kernel::EngineData;
 
-    let batch = scan_metadata
-        .scan_files
-        .data()
-        .any_ref()
-        .downcast_ref::<ArrowEngineData>()
-        .ok_or_else(|| Error::generic("Cached scan metadata requires Arrow engine data"))?
-        .record_batch();
+    fn record_batch(data: &dyn EngineData) -> DeltaResult<&delta_kernel::arrow::array::RecordBatch> {
+        Ok(data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| Error::generic("Cached scan metadata requires Arrow engine data"))?
+            .record_batch())
+    }
+
+    // The scan rows keep the `stats` JSON, which `Scan::scan_metadata_from` parses again. A
+    // checkpoint written without `writeStatsAsJson` has the statistics only in `stats_parsed`, so
+    // take the JSON from there, as for the `remove` actions of a transaction.
+    let data = scan_metadata.scan_files.data();
+    let projected = if record_batch(data)?.schema_ref().column_with_name("stats_parsed").is_some() {
+        let row_schema = scan_row_schema();
+        let fields = row_schema.fields().map(|field| {
+            if field.name() == "stats" {
+                Expression::coalesce([
+                    Expression::column(["stats"]),
+                    Expression::unary(UnaryExpressionOp::ToJson, Expression::column(["stats_parsed"])),
+                ])
+            } else {
+                Expression::column([field.name().as_str()])
+            }
+        });
+        let input_schema = Arc::new(
+            StructType::try_from_arrow(record_batch(data)?.schema())
+                .map_err(|e| Error::generic(e.to_string()))?,
+        );
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            input_schema,
+            Arc::new(Expression::struct_from(fields)),
+            row_schema.into(),
+        )?;
+        Some(evaluator.evaluate(data)?)
+    } else {
+        None
+    };
+    let batch = record_batch(projected.as_deref().unwrap_or(data))?;
     let mut selection_vector = scan_metadata.scan_files.selection_vector().to_vec();
     selection_vector.resize(batch.num_rows(), true);
     let selected = filter_record_batch(batch, &BooleanArray::from(selection_vector))
